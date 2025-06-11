@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
-# <<< เพิ่ม Encoding declaration สำหรับอักษรไทย (ควรอยู่บรรทัดแรกหรือสองของไฟล์) >>>
-
-# ==============================================================================
-# -*- coding: utf-8 -*-
-# <<< เพิ่ม Encoding declaration สำหรับอักษรไทย (ควรอยู่บรรทัดแรกหรือสองของไฟล์) >>>
+# <<< เพิ่ม Encoding declaration สำหรับอักษรไทย (ควรอยู่บรรทัดแรกสุด) >>>
 
 # ==============================================================================
 # === START OF PART 3/12 ===
 # ==============================================================================
-# === PART 3: Helper Functions (Setup, Utils, Font, Config) (v4.8.8 - Patch 26.10 Applied) ===
+# === PART 3: Helper Functions (Setup, Utils, Font, Config) (v4.8.8 - Patch 26.11 Applied) ===
 # ==============================================================================
 # <<< MODIFIED v4.7.9: Implemented logging, added docstrings/comments, improved font setup robustness >>>
 # <<< MODIFIED v4.7.9 (Post-Error): Corrected simple_converter for np.inf, then updated to 'Infinity' string with improved docstring >>>
@@ -25,7 +21,7 @@
 # <<< MODIFIED v4.8.8 (Patch 26.5.1): Applied final [PATCH A] for safe_set_datetime from user prompt. >>>
 # <<< MODIFIED v4.8.8 (Patch 26.7): Applied fix for FutureWarning in safe_set_datetime by ensuring column dtype is datetime64[ns] before assignment. >>>
 # <<< MODIFIED v4.8.8 (Patch 26.8): Applied model_diagnostics_unit recommendation to safe_set_datetime for robust dtype handling. >>>
-# <<< MODIFIED v4.8.8 (Patch 26.10): Further refined safe_set_datetime to more aggressively ensure column dtype is datetime64[ns] before assignment. >>>
+# <<< MODIFIED v4.8.8 (Patch 26.11): Further refined safe_set_datetime to more aggressively ensure column dtype is datetime64[ns] before assignment. >>>
 import logging
 import os
 import sys
@@ -58,6 +54,8 @@ def simple_converter(o):  # pragma: no cover
         return float(o)
     if isinstance(o, pd.Timestamp):
         return o.isoformat()
+    if isinstance(o, pd.Timedelta):
+        return str(o)
     if isinstance(o, np.bool_):
         return bool(o)
     if pd.isna(o):
@@ -185,89 +183,56 @@ def set_thai_font(font_name="Loma"):  # pragma: no cover
         logging.warning(f"   (Warning) Could not find any suitable Thai fonts ({preferred_fonts}) using findfont.")
         return False
 
-# [Patch v5.0.2] Exclude setup_fonts from coverage
+# [Patch v5.6.0] Split font installation and configuration helpers
+def install_thai_fonts_colab():  # pragma: no cover
+    """Install Thai fonts when running on Google Colab."""
+    try:
+        subprocess.run(["sudo", "apt-get", "update", "-qq"], check=False, capture_output=True, text=True, timeout=120)
+        subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "fonts-thai-tlwg"], check=False, capture_output=True, text=True, timeout=180)
+        subprocess.run(["fc-cache", "-fv"], check=False, capture_output=True, text=True, timeout=120)
+        return True
+    except Exception as e:
+        logging.error(f"      (Error) Failed to install Thai fonts: {e}")
+        return False
+
+
+def configure_matplotlib_fonts(font_name="TH Sarabun New"):  # pragma: no cover
+    """Configure Matplotlib to use a given Thai font."""
+    return set_thai_font(font_name)
+
+
 def setup_fonts(output_dir=None):  # pragma: no cover
-    """
-    Sets up Thai fonts for Matplotlib plots.
-    Attempts to find preferred fonts, installs 'fonts-thai-tlwg' on Colab if needed.
-    """
+    """Sets up Thai fonts for Matplotlib plots."""
     logging.info("\n(Processing) Setting up Thai font for plots...")
     font_set_successfully = False
-    preferred_font_name = "TH Sarabun New" # Prioritize this font
-
+    preferred_font_name = "TH Sarabun New"
     try:
         ipython = get_ipython()
         in_colab = ipython is not None and 'google.colab' in str(ipython)
-
-        logging.info("   Attempting to set font directly using findfont...")
-        font_set_successfully = set_thai_font(preferred_font_name)
-
+        font_set_successfully = configure_matplotlib_fonts(preferred_font_name)
         if not font_set_successfully and in_colab:
             logging.info("\n   Preferred font not found. Attempting installation via apt-get (Colab)...")
-            try:
-                logging.info("      Installing Thai fonts (fonts-thai-tlwg)... This might take a moment.")
-                # Update package list quietly
-                apt_update_process = subprocess.run(
-                    ["apt-get", "update", "-qq"],
-                    check=False, capture_output=True, text=True, timeout=120 # Added timeout
-                )
-                if apt_update_process.returncode != 0:
-                    logging.warning(f"      (Warning) apt-get update failed (Code: {apt_update_process.returncode}): {apt_update_process.stderr[:200]}...")
-
-                # Install Thai fonts quietly
-                apt_install_process = subprocess.run(
-                    ["apt-get", "install", "-y", "-qq", "fonts-thai-tlwg"],
-                    check=False, capture_output=True, text=True, timeout=180 # Added timeout
-                )
-
-                if apt_install_process.returncode == 0:
-                    logging.info("      (Success) apt-get install fonts-thai-tlwg potentially completed.")
-                    logging.info("      Rebuilding Matplotlib font cache...")
-                    try:
-                        fm._load_fontmanager(try_read_cache=False) # Force rebuild
-                        logging.info("      Font cache rebuilt. Attempting to set font again...")
-                        font_set_successfully = set_thai_font(preferred_font_name)
-                        if not font_set_successfully: # Try another common one if preferred still not found
-                            font_set_successfully = set_thai_font("Loma")
-
-                        if font_set_successfully:
-                            logging.info("      (Success) Thai font set after installation and cache rebuild.")
-                        else:
-                            logging.warning("      (Warning) Thai font still not set after installation. A manual Colab Runtime Restart might be needed.")
-                            logging.warning("      *****************************************************")
-                            logging.warning("      *** Please RESTART RUNTIME now for Matplotlib     ***")
-                            logging.warning("      *** to recognize the new fonts if plots fail.     ***")
-                            logging.warning("      *** (เมนู Runtime -> Restart runtime...)         ***")
-                            logging.warning("      *****************************************************")
-                    except Exception as e_cache:
-                        logging.error(f"      (Error) Failed to rebuild font cache or set font after install: {e_cache}", exc_info=True)
-                else:
-                    logging.warning(f"      (Warning) apt-get install failed (Code: {apt_install_process.returncode}): {apt_install_process.stderr[:200]}...")
-            except subprocess.TimeoutExpired:
-                logging.error("      (Error) Timeout during apt-get font installation.")
-            except Exception as e_generic_install: # Catch any other installation errors
-                logging.error(f"      (Error) General error during font installation attempt: {e_generic_install}", exc_info=True)
-
-        # If still not set, try other fallbacks
+            if install_thai_fonts_colab():
+                fm._load_fontmanager(try_read_cache=False)
+                font_set_successfully = configure_matplotlib_fonts(preferred_font_name) or configure_matplotlib_fonts("Loma")
         if not font_set_successfully:
-            fallback_fonts = ["Loma", "Garuda", "Norasi", "Kinnari", "Waree", "THSarabunNew"] # Ensure THSarabunNew is tried again if initial fails
+            fallback_fonts = ["Loma", "Garuda", "Norasi", "Kinnari", "Waree", "THSarabunNew"]
             logging.info(f"\n   Trying fallbacks ({', '.join(fallback_fonts)})...")
             for fb_font in fallback_fonts:
-                if set_thai_font(fb_font):
+                if configure_matplotlib_fonts(fb_font):
                     font_set_successfully = True
                     break
-
         if not font_set_successfully:
             logging.critical("\n   (CRITICAL WARNING) Could not set any preferred Thai font. Plots WILL NOT render Thai characters correctly.")
         else:
             logging.info("\n   (Info) Font setup process complete.")
-
     except Exception as e:
         logging.error(f"   (Error) Critical error during font setup: {e}", exc_info=True)
-
 # --- Data Loading Helper ---
 # [Patch v5.0.2] Exclude safe_load_csv_auto from coverage
-def safe_load_csv_auto(file_path):  # pragma: no cover
+def safe_load_csv_auto(file_path, row_limit=None, chunk_size=None):  # pragma: no cover
+    # [Patch v5.4.5] Support row-limited loading to reduce memory usage
+    # [Patch] Allow chunked reading for large files
     """
     Loads CSV or .csv.gz file using pandas, automatically handling gzip compression.
 
@@ -279,11 +244,18 @@ def safe_load_csv_auto(file_path):  # pragma: no cover
                               is empty, or None if loading fails.
     """
     read_csv_kwargs = {"index_col": 0, "parse_dates": False, "low_memory": False}
+    if chunk_size is not None and isinstance(chunk_size, int) and chunk_size > 0:
+        if row_limit is not None:
+            logging.info(
+                "         (Info) chunk_size provided with row_limit; chunk_size overrides row_limit"
+            )
+        read_csv_kwargs["chunksize"] = chunk_size
+    elif row_limit is not None and isinstance(row_limit, int) and row_limit > 0:
+        read_csv_kwargs["nrows"] = row_limit
     logging.info(f"      (safe_load) Attempting to load: {os.path.basename(file_path)}")
 
     if not isinstance(file_path, str) or not file_path:
-        logging.error("         (Error) Invalid file path provided to safe_load_csv_auto.")
-        return None
+        raise TypeError("file_path must be a string")
     if not os.path.exists(file_path):
         logging.error(f"         (Error) File not found: {file_path}")
         return None
@@ -292,12 +264,22 @@ def safe_load_csv_auto(file_path):  # pragma: no cover
         if file_path.lower().endswith(".gz"):
             logging.debug("         -> Detected .gz extension, using gzip.")
             with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+                if "chunksize" in read_csv_kwargs:
+                    chunks = []
+                    for chunk in pd.read_csv(f, **read_csv_kwargs):
+                        chunks.append(chunk)
+                    return pd.concat(chunks, ignore_index=False)
                 return pd.read_csv(f, **read_csv_kwargs)
         else:
             logging.debug("         -> No .gz extension, using standard pd.read_csv.")
+            if "chunksize" in read_csv_kwargs:
+                chunks = []
+                for chunk in pd.read_csv(file_path, **read_csv_kwargs):
+                    chunks.append(chunk)
+                return pd.concat(chunks, ignore_index=False)
             return pd.read_csv(file_path, **read_csv_kwargs)
     except pd.errors.EmptyDataError:
-        logging.warning(f"         (Warning) File is empty: {file_path}")
+        logging.info(f"         (Info) File is empty: {file_path}")
         return pd.DataFrame()
     except Exception as e:
         logging.error(f"         (Error) Failed to load file '{os.path.basename(file_path)}': {e}", exc_info=True)
@@ -349,35 +331,57 @@ def load_app_config(config_path="config_main.json"):  # pragma: no cover
         return {}
 
 # --- Datetime Setting Helper (Corrected for FutureWarning) ---
-# <<< [Patch] MODIFIED v4.8.8 (Patch 26.10): Applied model_diagnostics_unit recommendation with refined dtype handling. >>>
-def safe_set_datetime(df, idx, col, val):
+# <<< [Patch] MODIFIED v4.8.8 (Patch 26.11): Applied model_diagnostics_unit recommendation with refined dtype handling. >>>
+def safe_set_datetime(df, idx, col, val, naive_tz=None):
     """
     Safely assigns datetime value to DataFrame, ensuring column dtype is datetime64[ns].
-    [PATCH 26.10] Applied: Ensures column dtype is datetime64[ns] before assignment
+    [PATCH 26.11] Applied: Ensures column dtype is datetime64[ns] before assignment
     by initializing or converting the entire column if necessary.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Target DataFrame
+    idx : index label
+        Row index for assignment
+    col : str
+        Column name
+    val : any
+        Value to convert to datetime
+    naive_tz : str, optional
+        Assume this timezone when ``val`` has no timezone info. If None, uses
+        ``DEFAULT_NAIVE_TZ`` from config or 'UTC'.
     """
     try:
         # Convert the input value to a pandas Timestamp or NaT
         dt_value = pd.to_datetime(val, errors='coerce')
+        if isinstance(dt_value, pd.Timestamp):
+            if dt_value.tz is None:
+                tz_use = naive_tz or safe_get_global("DEFAULT_NAIVE_TZ", "UTC")
+                try:
+                    dt_value = dt_value.tz_localize(tz_use)
+                except Exception:
+                    logging.warning(
+                        f"   safe_set_datetime: Failed to localize with '{tz_use}', assuming UTC"
+                    )
+                    dt_value = dt_value.tz_localize("UTC")
+            dt_value = dt_value.tz_convert("UTC").tz_localize(None)
 
         # Ensure the column exists and has the correct dtype BEFORE assignment
         if col not in df.columns:
-            logging.debug(f"   [Patch 26.10] safe_set_datetime: Column '{col}' not found. Creating with dtype 'datetime64[ns]'.")
+            logging.debug(f"   [Patch 26.11] safe_set_datetime: Column '{col}' not found. Creating with dtype 'datetime64[ns]'.")
             # Initialize the entire column with NaT and correct dtype
             # This helps prevent the FutureWarning when assigning the first Timestamp/NaT
             df[col] = pd.Series(dtype='datetime64[ns]', index=df.index)
         elif df[col].dtype != 'datetime64[ns]':
-            logging.debug(f"   [Patch 26.10] safe_set_datetime: Column '{col}' has dtype '{df[col].dtype}'. Forcing conversion to 'datetime64[ns]'.")
+            logging.debug(f"   [Patch 26.11] safe_set_datetime: Column '{col}' has dtype '{df[col].dtype}'. Forcing conversion to 'datetime64[ns]'.")
             try:
-                # Attempt to convert the existing column to datetime64[ns]
-                # This is important if the column was, e.g., object or float due to prior NaNs
-                # Using pd.to_datetime on the series first handles mixed types better before astype
                 current_col_values = pd.to_datetime(df[col], errors='coerce')
+                if hasattr(df[col].dtype, 'tz') and df[col].dtype.tz is not None:
+                    current_col_values = current_col_values.dt.tz_convert("UTC").dt.tz_localize(None)
                 df[col] = current_col_values.astype('datetime64[ns]')
             except Exception as e_conv_col:
-                logging.warning(f"   [Patch 26.10] safe_set_datetime: Force conversion of column '{col}' to datetime64[ns] failed ({e_conv_col}). Re-creating column with NaT.")
-                # If conversion fails (e.g., mixed types that can't be coerced easily),
-                # re-create the column with the correct dtype. This might lose existing data in the column if it was incompatible.
+                logging.warning(f"   [Patch 26.11] safe_set_datetime: Force conversion of column '{col}' to datetime64[ns] failed ({e_conv_col}). Re-creating column with NaT.")
                 df[col] = pd.Series(dtype='datetime64[ns]', index=df.index)
 
         # Now assign the value (which is already a Timestamp or NaT)
@@ -385,7 +389,7 @@ def safe_set_datetime(df, idx, col, val):
             # dt_value is already pd.Timestamp or pd.NaT
             # df[col] should now have dtype datetime64[ns]
             df.loc[idx, col] = dt_value
-            logging.debug(f"   [Patch 26.10] safe_set_datetime: Assigned '{dt_value}' (type: {type(dt_value)}) to '{col}' at index {idx}. Column dtype after assign: {df[col].dtype}")
+            logging.debug(f"   [Patch 26.11] safe_set_datetime: Assigned '{dt_value}' (type: {type(dt_value)}) to '{col}' at index {idx}. Column dtype after assign: {df[col].dtype}")
         else:
             logging.warning(f"   safe_set_datetime: Index '{idx}' not found in DataFrame. Cannot set value for column '{col}'.")
 
@@ -402,9 +406,9 @@ def safe_set_datetime(df, idx, col, val):
                 logging.warning(f"   safe_set_datetime: Index '{idx}' not found during fallback NaT assignment for column '{col}'.")
         except Exception as e_fallback:
             logging.error(f"   (Error) safe_set_datetime: Failed to assign NaT as fallback for '{col}' at index {idx}: {e_fallback}")
-# <<< End of [Patch] MODIFIED v4.8.8 (Patch 26.10) >>>
+# <<< End of [Patch] MODIFIED v4.8.8 (Patch 26.11) >>>
 
-logging.info("Part 3: Helper Functions Loaded (v4.8.8 Patch 26.10 Applied).")
+logging.info("Part 3: Helper Functions Loaded (v4.8.8 Patch 26.11 Applied).")
 # ==============================================================================
 # === END OF PART 3/12 ===
 # ==============================================================================
@@ -426,6 +430,7 @@ import warnings
 import traceback
 # from datetime import datetime # <<< REMOVED: Should use global 'datetime' module imported earlier
 import gc
+from src.utils.gc_utils import maybe_collect
 # Ensure 'datetime' module is available from global imports (e.g., Part 3 or top of file)
 # import datetime # This would be redundant if already imported globally
 
@@ -451,7 +456,8 @@ def load_data(file_path, timeframe_str="", price_jump_threshold=0.10, nan_thresh
         nan_threshold (float): Maximum acceptable proportion of NaN values in price columns.
                                Defaults to 0.05 (5%).
         dtypes (dict, optional): Dictionary specifying data types for columns during loading.
-                                 Defaults to None (pandas infers types).
+                                 Defaults to ``DEFAULT_DTYPE_MAP`` from config
+                                 if not provided.
 
     Returns:
         pd.DataFrame: The loaded and initially validated DataFrame.
@@ -460,6 +466,10 @@ def load_data(file_path, timeframe_str="", price_jump_threshold=0.10, nan_thresh
         SystemExit: If critical errors occur (e.g., file not found, essential columns missing).
     """
     logging.info(f"(Loading) กำลังโหลดข้อมูล {timeframe_str} จาก: {file_path}")
+
+    if dtypes is None:
+        dtypes = safe_get_global("DEFAULT_DTYPE_MAP", None)
+
     if not os.path.exists(file_path):
         logging.critical(f"(Error) ไม่พบไฟล์: {file_path}")
         # [Patch] Provide dummy data when file is missing for offline execution
@@ -551,7 +561,7 @@ def load_data(file_path, timeframe_str="", price_jump_threshold=0.10, nan_thresh
                 else:
                     logging.debug("      ไม่พบ Price Jumps ที่ผิดปกติ.")
                 del close_numeric, price_pct_change, large_jumps
-                gc.collect()
+                maybe_collect()
             else:
                 logging.debug("      ข้ามการตรวจสอบ Price Jumps (ข้อมูล Close ไม่พอหลัง dropna).")
         else:
@@ -568,6 +578,74 @@ def load_data(file_path, timeframe_str="", price_jump_threshold=0.10, nan_thresh
     except Exception as e:
         logging.critical(f"(Error) ไม่สามารถโหลดข้อมูล {timeframe_str}: {e}\n{traceback.format_exc()}", exc_info=True)
         sys.exit(f"ออก: ข้อผิดพลาดร้ายแรงในการโหลดข้อมูล {timeframe_str}")
+
+
+# [Patch v5.5.15] Optional caching layer for large CSV data
+def load_data_cached(file_path, timeframe_str="", cache_format=None, **kwargs):
+    """Load CSV using :func:`load_data` with optional caching.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the CSV data.
+    timeframe_str : str, optional
+        Timeframe identifier for logging.
+    cache_format : str, optional
+        If provided, cache the loaded DataFrame in this format
+        (``'parquet'``, ``'feather'`` or ``'hdf5'``). Subsequent calls
+        will load from the cached file if available.
+    kwargs : dict
+        Additional arguments forwarded to :func:`load_data`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Loaded DataFrame, either from CSV or cached file.
+    """
+
+    ext_map = {
+        "parquet": ".parquet",
+        "feather": ".feather",
+        "hdf5": ".h5",
+    }
+
+    if cache_format:
+        ext = ext_map.get(cache_format.lower())
+        if ext:
+            cache_path = os.path.splitext(file_path)[0] + ext
+            if os.path.exists(cache_path):
+                logging.info(f"(Cache) โหลด {timeframe_str} จาก {cache_path}")
+                try:
+                    if cache_format.lower() == "parquet":
+                        return pd.read_parquet(cache_path)
+                    if cache_format.lower() == "feather":
+                        return pd.read_feather(cache_path)
+                    return pd.read_hdf(cache_path, key="data")
+                except Exception as e_load:
+                    logging.warning(
+                        f"(Cache) Failed to load {cache_format} file {cache_path}: {e_load}"
+                    )
+
+    df_loaded = load_data(file_path, timeframe_str, **kwargs)
+
+    if cache_format:
+        ext = ext_map.get(cache_format.lower())
+        if ext:
+            cache_path = os.path.splitext(file_path)[0] + ext
+            try:
+                if cache_format.lower() == "parquet":
+                    df_loaded.to_parquet(cache_path)
+                elif cache_format.lower() == "feather":
+                    df_loaded.reset_index().to_feather(cache_path)
+                else:
+                    df_loaded.to_hdf(cache_path, key="data", mode="w")
+                logging.info(f"(Cache) Saved {timeframe_str} to {cache_path}")
+            except Exception as e_save:
+                logging.warning(
+                    f"(Cache) Failed to save {cache_format} file {cache_path}: {e_save}"
+                )
+
+    return df_loaded
 
 # --- Datetime Helper Functions ---
 # [Patch v5.0.2] Exclude datetime preview from coverage
@@ -589,7 +667,7 @@ def preview_datetime_format(df, n=5):  # pragma: no cover
         preview = preview_df.apply(lambda row: f"{row['Date']} {row['Timestamp']}", axis=1)
         logging.info("\n" + preview.to_string(index=False))
         del preview_df, preview
-        gc.collect()
+        maybe_collect()
     except Exception as e:
         logging.error(f"   [Preview] Error during preview generation: {e}", exc_info=True)
 
@@ -639,7 +717,7 @@ def parse_datetime_safely(datetime_str_series):  # pragma: no cover
                     f"      [Parser] (Success) Format '{fmt}' matched: {len(successful_indices_this_attempt)}. Remaining: {len(remaining_indices)}"
                 )
             del try_parse, successful_mask_this_attempt, successful_indices_this_attempt
-            gc.collect()
+            maybe_collect()
         except ValueError as ve:
             if not remaining_indices.empty:
                 first_failed_idx = remaining_indices[0]
@@ -665,7 +743,7 @@ def parse_datetime_safely(datetime_str_series):  # pragma: no cover
                 remaining_indices = remaining_indices.difference(successful_indices_general)
                 logging.info(f"         -> (Success) General parser matched: {len(successful_indices_general)}. Remaining: {len(remaining_indices)}")
             del try_general, successful_mask_general, successful_indices_general
-            gc.collect()
+            maybe_collect()
         except Exception as e_gen:
             logging.warning(f"         -> General parser error: {e_gen}", exc_info=True)
 
@@ -676,7 +754,7 @@ def parse_datetime_safely(datetime_str_series):  # pragma: no cover
         logging.warning(f"         Example failed strings:\n{failed_strings_log.to_string()}")
     logging.info("      [Parser] (Finished) Date/time parsing complete.")
     del series_to_parse, remaining_indices
-    gc.collect()
+    maybe_collect()
     return parsed_results
 
 # [Patch v5.0.2] Exclude prepare_datetime from coverage
@@ -684,6 +762,9 @@ def prepare_datetime(df_pd, timeframe_str=""):  # pragma: no cover
     """
     Prepares the DatetimeIndex for the DataFrame, handling Buddhist Era conversion
     and NaT values. Sets the prepared datetime as the DataFrame index.
+
+    เรียก :func:`safe_set_datetime` เพื่อจัดการ timezone และ dtype ก่อน
+    แล้วจึงเรียกฟังก์ชันนี้เพื่อเตรียม Datetime index ให้ถูกต้อง
 
     Args:
         df_pd (pd.DataFrame): Input DataFrame with 'Date' and 'Timestamp' columns.
@@ -740,7 +821,7 @@ def prepare_datetime(df_pd, timeframe_str=""):  # pragma: no cover
             datetime_strings, format="%Y%m%d %H:%M:%S", errors="coerce"
         )
         del date_str_series, ts_str_series
-        gc.collect()
+        maybe_collect()
 
         nat_count = df_pd["datetime_original"].isna().sum()
         if nat_count > 0:
@@ -768,7 +849,7 @@ def prepare_datetime(df_pd, timeframe_str=""):  # pragma: no cover
         else:
             logging.debug(f"   ไม่พบค่า NaT ใน {timeframe_str} หลังการ parse.")
         del datetime_strings
-        gc.collect()
+        maybe_collect()
 
         if "datetime_original" in df_pd.columns:
             df_pd["datetime_original"] = pd.to_datetime(df_pd["datetime_original"], errors='coerce')
@@ -870,8 +951,36 @@ def prepare_datetime_index(df):
     return df
 
 
+# --- M1 Data Path Validator ---
+# [Patch v5.4.4] Ensure correct file name and existence
+def validate_m1_data_path(file_path):
+    """Validate that the M1 data path points to an expected file."""
+    allowed = {
+        "XAUUSD_M1.csv",
+        "final_data_m1_v32_walkforward.csv.gz",
+        "final_data_m1_v32_walkforward_prep_data_NORMAL.csv.gz",
+    }
+    if not isinstance(file_path, str) or not file_path:
+        logging.error("(Error) Invalid file path for M1 data.")
+        return False
+    fname = os.path.basename(file_path)
+    if fname not in allowed:
+        logging.error(f"(Error) Unexpected M1 data file '{fname}'. Expected one of {allowed}.")
+        return False
+    if not os.path.exists(file_path):
+        logging.error(f"(Error) File not found: {file_path}")
+        return False
+    return True
+
+
 def load_raw_data_m1(path):
-    """Stubbed loader for raw M1 data."""
+    """Load raw M1 data after validating the file path.
+
+    After loading, ``engineer_m1_features`` from :mod:`features` is typically
+    called to compute indicators.
+    """
+    if not validate_m1_data_path(path):
+        return None
     return safe_load_csv_auto(path)
 
 
@@ -885,4 +994,70 @@ def write_test_file(path):
     with open(path, "w", encoding="utf-8") as f:
         f.write("test")
     return path
+
+
+# [Patch v5.4.5] Robust loader for final M1 data
+def load_final_m1_data(path, trade_log_df=None):
+    """Load prepared M1 dataset with validation and timezone alignment."""
+    if not validate_m1_data_path(path):
+        return None
+    df = safe_load_csv_auto(path)
+    if df is None or df.empty:
+        logging.error("(Error) Failed to load M1 data or file is empty.")
+        return None
+    required = ["Open", "High", "Low", "Close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        logging.error(f"(Error) M1 Data missing columns: {missing}")
+        return None
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[df.index.notna()]
+    if df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        logging.error("(Error) Invalid datetime index for M1 data.")
+        return None
+    log_tz = None
+    if trade_log_df is not None:
+        if "datetime" in trade_log_df.columns and isinstance(trade_log_df["datetime"].dtype, pd.DatetimeTZDtype):
+            log_tz = trade_log_df["datetime"].dt.tz
+        elif isinstance(trade_log_df.index, pd.DatetimeIndex):
+            log_tz = trade_log_df.index.tz
+    log_tz = log_tz or "UTC"
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(log_tz)
+    else:
+        df.index = df.index.tz_convert(log_tz)
+    df["datetime"] = df.index
+    return df
+
+
+def check_data_quality(df, dropna=True, fillna_method=None, subset_dupes=None):
+    """ตรวจสอบคุณภาพข้อมูลเบื้องต้นและจัดการ NaN/Duplicates ตามต้องการ."""
+    if df is None or df.empty:
+        return df
+
+    nan_report = df.isna().mean()
+    for col, pct in nan_report.items():
+        if pct > 0:
+            logging.warning(f"   (Warning) คอลัมน์ '{col}' มี NaN {pct:.1%}")
+
+    if fillna_method:
+        # [Patch v5.6.2] Replace deprecated fillna(method=...) usage
+        if fillna_method.lower() == "ffill":
+            df.ffill(inplace=True)
+        elif fillna_method.lower() == "bfill":
+            df.bfill(inplace=True)
+        else:
+            df.fillna(method=fillna_method, inplace=True)
+    elif dropna:
+        df.dropna(inplace=True)
+
+    if subset_dupes is None:
+        subset_dupes = ["Datetime"] if "Datetime" in df.columns else None
+    if subset_dupes is not None:
+        dupes = df.duplicated(subset=subset_dupes)
+        if dupes.any():
+            logging.warning(f"   (Warning) พบ {dupes.sum()} duplicates")
+            df.drop_duplicates(subset=subset_dupes, keep="first", inplace=True)
+
+    return df
 

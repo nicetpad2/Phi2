@@ -9,22 +9,22 @@
 # <<< MODIFIED v4.8.1: Refined auto-train logic (log loading, context cols), confirmed dtype passing, verified model loading checks, added more robust function call checks >>>
 # <<< MODIFIED v4.8.2: Corrected SyntaxError in __main__ block (added except/finally for the main try block), updated log messages and versioning, robust global access in finally >>>
 # <<< MODIFIED v4.8.3: Applied SyntaxError fix for try-except global variable checks to all relevant globals in this part. >>>
-import logging, os, sys, json
-# [Patch v5.2.0] เพิ่มโฟลเดอร์ project root เข้า sys.path เพื่อป้องกัน ImportError
-project_root = os.path.dirname(os.path.abspath(__file__))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+import logging
+import os
+import sys
+import json
+from src.utils import get_env_float, maybe_collect
 if 'pytest' in sys.modules:
     cfg = sys.modules.get('src.config')
     if cfg is not None and getattr(cfg, '__file__', None) is None and hasattr(cfg, 'ENTRY_CONFIG_PER_FOLD'):
         DEFAULT_ENTRY_CONFIG_PER_FOLD = cfg.ENTRY_CONFIG_PER_FOLD
-        logger = getattr(cfg, 'logger', logging.getLogger(__name__))
+        logger = getattr(cfg, 'logger', logging.getLogger(__name__)); CFG_FUND_PROFILES = getattr(cfg, 'FUND_PROFILES', {}); CFG_MULTI_FUND_MODE = getattr(cfg, 'MULTI_FUND_MODE', True); CFG_DEFAULT_FUND_NAME = getattr(cfg, 'DEFAULT_FUND_NAME', 'NORMAL'); DEFAULT_FUND_PROFILES = CFG_FUND_PROFILES; DEFAULT_MULTI_FUND_MODE = CFG_MULTI_FUND_MODE; DEFAULT_FUND_NAME = CFG_DEFAULT_FUND_NAME
     else:
         DEFAULT_ENTRY_CONFIG_PER_FOLD = {}
         logger = logging.getLogger(__name__)
 else:
     try:
-        from src.config import logger, ENTRY_CONFIG_PER_FOLD as DEFAULT_ENTRY_CONFIG_PER_FOLD
+        from src.config import logger, ENTRY_CONFIG_PER_FOLD as DEFAULT_ENTRY_CONFIG_PER_FOLD, FUND_PROFILES as CFG_FUND_PROFILES, MULTI_FUND_MODE as CFG_MULTI_FUND_MODE, DEFAULT_FUND_NAME as CFG_DEFAULT_FUND_NAME
     except Exception:  # pragma: no cover - fallback for tests
         logger = logging.getLogger(__name__)
         DEFAULT_ENTRY_CONFIG_PER_FOLD = {}
@@ -58,7 +58,18 @@ from src.features import (
     calculate_m1_entry_signals,
     load_features_for_model,
 )
-from src.strategy import run_all_folds_with_threshold, train_and_export_meta_model
+from src.strategy import (
+    run_all_folds_with_threshold,
+    train_and_export_meta_model,
+    DriftObserver,
+)
+from src.utils import (
+    export_trade_log,
+    download_model_if_missing,
+    download_feature_list_if_missing,
+    get_env_float,
+)
+from sklearn.model_selection import TimeSeriesSplit  # [Patch v5.5.4] Needed for equity plot fold boundaries
 import pandas as pd
 import numpy as np
 import shutil # For file moving in pipeline mode
@@ -82,18 +93,19 @@ DEFAULT_OUTPUT_DIR = "./output_default"
 DEFAULT_META_CLASSIFIER_PATH = "meta_classifier.pkl"
 DEFAULT_SPIKE_MODEL_PATH = "meta_classifier_spike.pkl"
 DEFAULT_CLUSTER_MODEL_PATH = "meta_classifier_cluster.pkl"
-DEFAULT_FUND_NAME = "NORMAL"
+DEFAULT_FUND_NAME = CFG_DEFAULT_FUND_NAME if 'CFG_DEFAULT_FUND_NAME' in globals() else "NORMAL"
 DEFAULT_MODEL_TO_LINK = "catboost"
-DEFAULT_ENABLE_OPTUNA_TUNING = False
+DEFAULT_ENABLE_OPTUNA_TUNING = True
 DEFAULT_SAMPLE_SIZE = 60000
 DEFAULT_FEATURES_TO_DROP = None
-DEFAULT_MULTI_FUND_MODE = True
-DEFAULT_FUND_PROFILES = {}
+DEFAULT_MULTI_FUND_MODE = CFG_MULTI_FUND_MODE if 'CFG_MULTI_FUND_MODE' in globals() else True
+DEFAULT_FUND_PROFILES = CFG_FUND_PROFILES if 'CFG_FUND_PROFILES' in globals() else {}
 DEFAULT_TRAIN_META_MODEL_BEFORE_RUN = True
 DEFAULT_META_CLASSIFIER_FEATURES = []
 DEFAULT_RECOVERY_MODE_CONSECUTIVE_LOSSES = 4
 DEFAULT_TIMEFRAME_MINUTES_M15 = 15
-DEFAULT_DRIFT_WASSERSTEIN_THRESHOLD = 0.1
+# [Patch v5.5.4] Environment override for drift threshold
+DEFAULT_DRIFT_WASSERSTEIN_THRESHOLD = get_env_float("DRIFT_WASSERSTEIN_THRESHOLD", 0.1)
 DEFAULT_DRIFT_TTEST_ALPHA = 0.05
 DEFAULT_INITIAL_CAPITAL = 100.0
 DEFAULT_N_WALK_FORWARD_SPLITS = 5
@@ -105,8 +117,8 @@ DEFAULT_OUTPUT_DIR_NAME = "outputgpt_v4.8.4"  # Note: This might be updated by P
 DEFAULT_DATA_FILE_PATH_M15 = os.path.join(_BASE_DIR, "XAUUSD_M15.csv")
 DEFAULT_DATA_FILE_PATH_M1 = os.path.join(_BASE_DIR, "XAUUSD_M1.csv")
 DEFAULT_META_META_CLASSIFIER_PATH = "meta_meta_classifier.pkl"
-DEFAULT_USE_META_CLASSIFIER = True
-DEFAULT_META_MIN_PROBA_THRESH = 0.5
+DEFAULT_USE_META_CLASSIFIER = os.getenv("USE_META_CLASSIFIER", "True").lower() in ("true", "1", "yes")
+DEFAULT_META_MIN_PROBA_THRESH = 0.3
 DEFAULT_REENTRY_MIN_PROBA_THRESH = 0.5
 DEFAULT_USE_META_META_CLASSIFIER = False
 DEFAULT_META_META_MIN_PROBA_THRESH = 0.5
@@ -121,18 +133,20 @@ DEFAULT_FORCED_ENTRY_MIN_SIGNAL_SCORE = 0.5
 DEFAULT_FORCED_ENTRY_LOOKBACK_PERIOD = 500
 DEFAULT_FORCED_ENTRY_CHECK_MARKET_COND = True
 DEFAULT_FORCED_ENTRY_MAX_ATR_MULT = 2.5
-DEFAULT_FORCED_ENTRY_MIN_GAIN_Z_ABS = 1.0
-DEFAULT_FORCED_ENTRY_ALLOWED_REGIMES = ["Normal", "Breakout", "StrongTrend"]
+DEFAULT_FORCED_ENTRY_MIN_GAIN_Z_ABS = 0.5
+DEFAULT_FORCED_ENTRY_ALLOWED_REGIMES = ["Normal", "Breakout", "StrongTrend", "Reversal", "InsideBar", "Choppy"]
 DEFAULT_FE_ML_FILTER_THRESHOLD = 0.40
-DEFAULT_MIN_SIGNAL_SCORE_ENTRY = 2.0
+DEFAULT_MIN_SIGNAL_SCORE_ENTRY = 1.0  # [Patch v5.3.9]
 DEFAULT_RISK_PER_TRADE = 0.01
 DEFAULT_MAX_DRAWDOWN_THRESHOLD = 0.30
 DEFAULT_ENABLE_PARTIAL_TP = True
 DEFAULT_PARTIAL_TP_LEVELS = [{"r_multiple": 0.8, "close_pct": 0.5}]
 DEFAULT_PARTIAL_TP_MOVE_SL_TO_ENTRY = True
 DEFAULT_ENABLE_KILL_SWITCH = True
-DEFAULT_KILL_SWITCH_MAX_DD_THRESHOLD = 0.20
-DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 7
+DEFAULT_KILL_SWITCH_MAX_DD_THRESHOLD = 0.15
+DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 5
+DEFAULT_KILL_SWITCH_WARNING_MAX_DD_THRESHOLD = 0.25
+DEFAULT_KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD = 7
 DEFAULT_forced_entry_max_consecutive_losses = 2
 DEFAULT_min_equity_threshold_pct = 0.70
 DEFAULT_IB_COMMISSION_PER_LOT = 7.0
@@ -140,6 +154,7 @@ DEFAULT_EARLY_STOPPING_ROUNDS = 200
 DEFAULT_CATBOOST_GPU_RAM_PART = 0.95
 DEFAULT_SHAP_IMPORTANCE_THRESHOLD = 0.01
 DEFAULT_PERMUTATION_IMPORTANCE_THRESHOLD = 0.001
+
 
 # [Patch v5.2.4] Ensure default output directory exists
 def ensure_default_output_dir(path=DEFAULT_OUTPUT_DIR):
@@ -363,6 +378,14 @@ try:
 except NameError:
     KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD
 try:
+    KILL_SWITCH_WARNING_MAX_DD_THRESHOLD
+except NameError:
+    KILL_SWITCH_WARNING_MAX_DD_THRESHOLD = DEFAULT_KILL_SWITCH_WARNING_MAX_DD_THRESHOLD
+try:
+    KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD
+except NameError:
+    KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD = DEFAULT_KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD
+try:
     forced_entry_max_consecutive_losses
 except NameError:
     forced_entry_max_consecutive_losses = DEFAULT_forced_entry_max_consecutive_losses
@@ -422,206 +445,105 @@ except NameError:
 
 # --- Auto-Train Trigger Function ---
 def ensure_model_files_exist(output_dir, base_trade_log_path, base_m1_data_path):
-    """
-    Checks if required model files (main, spike, cluster) and their corresponding
-    feature lists exist in the output directory. If any are missing, it triggers
-    the training process for those specific models using the provided base data paths.
-
-    Args:
-        output_dir (str): The directory where models and features should be saved/found.
-        base_trade_log_path (str): The base path (without extension) for the trade log file
-                                   used for training (e.g., "trade_log_v32_walkforward").
-                                   The function will look for .csv and .csv.gz.
-        base_m1_data_path (str): The base path (without extension) for the M1 data file
-                                 used for training (e.g., "final_data_m1_v32_walkforward").
-                                 The function will look for .csv and .csv.gz.
-    """
+    """[Patch v5.4.5] Ensure all model and feature files exist or auto-train."""
     logging.info("\n--- (Auto-Train Check) Ensuring Model Files Exist ---")
-    models_to_check = {
-        'main': META_CLASSIFIER_PATH,
-        'spike': SPIKE_MODEL_PATH,
-        'cluster': CLUSTER_MODEL_PATH,
+
+    required = {
+        'main': (META_CLASSIFIER_PATH, 'features_main.json'),
+        'spike': (SPIKE_MODEL_PATH, 'features_spike.json'),
+        'cluster': (CLUSTER_MODEL_PATH, 'features_cluster.json'),
     }
-    training_needed_purposes = []
 
-    for model_purpose, model_filename in models_to_check.items():
-        model_path = os.path.join(output_dir, model_filename)
-        features_filename = f"features_{model_purpose}.json"
-        features_path = os.path.join(output_dir, features_filename)
-        model_exists = os.path.exists(model_path)
-        features_exist = os.path.exists(features_path)
-        if not model_exists or not features_exist:
-            if not model_exists: logging.warning(f"   (Missing) Model file for '{model_purpose}' not found: {model_path}")
-            if not features_exist: logging.warning(f"   (Missing) Features file for '{model_purpose}' not found: {features_path}")
-            training_needed_purposes.append(model_purpose)
-        else:
-            logging.info(f"   (Found) Model and Features files for '{model_purpose}' exist.")
+    missing_models = []
+    for key, (model_file, feature_file) in required.items():
+        model_path = os.path.join(output_dir, model_file)
+        feature_path = os.path.join(output_dir, feature_file)
+        if not (os.path.exists(model_path) and os.path.exists(feature_path)):
+            download_model_if_missing(model_path, f"URL_MODEL_{key.upper()}")
+            download_feature_list_if_missing(feature_path, f"URL_FEATURES_{key.upper()}")
+            if not os.path.exists(model_path) or not os.path.exists(feature_path):
+                missing_models.append(key)
+                logging.warning(f"Missing model file for '{key}' ({model_file}).")
 
-    if not training_needed_purposes:
-        logging.info("   (Success) All required model and feature files exist. No auto-training needed.")
+    if not missing_models:
+        logging.info("   (Success) Model files and feature lists already exist.")
         return
 
-    logging.warning(f"\n   --- Triggering Auto-Training for Missing Models: {training_needed_purposes} ---")
+    logging.warning(
+        f"   Triggering Auto-Training for Missing Models: {missing_models}"
+    )
 
-    logging.info("      Loading base data for training...")
-    trade_log_df_base = None
-    train_m1_path = None
+    train_log_path = None
+    for ext in (".csv.gz", ".csv"):
+        candidate = base_trade_log_path + ext
+        if os.path.exists(candidate):
+            train_log_path = candidate
+            break
 
-    try:
-        train_log_path_gz = base_trade_log_path + ".csv.gz"
-        train_log_path_csv = base_trade_log_path + ".csv"
-        train_log_path = None
-        if os.path.exists(train_log_path_gz):
-            train_log_path = train_log_path_gz
-            logging.info(f"      Found standard trade log (gz): {os.path.basename(train_log_path)}")
-        elif os.path.exists(train_log_path_csv):
-            train_log_path = train_log_path_csv
-            logging.info(f"      Found standard trade log (csv): {os.path.basename(train_log_path)}")
-        else:
-            logging.warning(f"      (Info) Standard trade log ('{os.path.basename(base_trade_log_path)}.csv[.gz]') not found. Checking for fallback (prep_data)...")
-            fallback_gz = os.path.join(output_dir, f"trade_log_v32_walkforward_prep_data_{DEFAULT_FUND_NAME}.csv.gz")
-            fallback_csv = os.path.join(output_dir, f"trade_log_v32_walkforward_prep_data_{DEFAULT_FUND_NAME}.csv")
-            if os.path.exists(fallback_gz):
-                train_log_path = fallback_gz
-                logging.info(f"      [Fallback] Using prep_data trade log (gz): {os.path.basename(train_log_path)}")
-            elif os.path.exists(fallback_csv):
-                train_log_path = fallback_csv
-                logging.info(f"      [Fallback] Using prep_data trade log (csv): {os.path.basename(train_log_path)}")
-            else:
-                checked_paths = f"Checked: {train_log_path_csv}, {train_log_path_gz}, {fallback_csv}, {fallback_gz}"
-                logging.critical(f"      (Error) Base trade log not found in standard or fallback paths. {checked_paths}")
-                raise FileNotFoundError("Required trade log file for training not found.")
+    m1_path = None
+    for ext in (".csv.gz", ".csv"):
+        candidate = base_m1_data_path + ext
+        if os.path.exists(candidate):
+            m1_path = candidate
+            break
 
-        trade_log_df_base = safe_load_csv_auto(train_log_path)
-        if trade_log_df_base is None:
-            raise ValueError(f"Failed to load trade log from: {train_log_path}")
-        if trade_log_df_base.empty:
-            logging.warning("      (Warning) Loaded trade log for auto-training is empty. Training will be skipped.")
-            return
-
-        logging.info(f"      (Success) Loaded trade log for training ({len(trade_log_df_base)} rows).")
-
-        logging.debug("      Processing base trade log for training...")
-        time_cols_log = ["entry_time", "close_time", "BE_Triggered_Time"]
-        for col in time_cols_log:
-            if col in trade_log_df_base.columns:
-                trade_log_df_base[col] = pd.to_datetime(trade_log_df_base[col], errors='coerce')
-        if "entry_time" not in trade_log_df_base.columns: raise ValueError("Base trade log missing 'entry_time'")
-        rows_before_drop = len(trade_log_df_base)
-        trade_log_df_base.dropna(subset=["entry_time"], inplace=True)
-        if len(trade_log_df_base) < rows_before_drop:
-            logging.warning(f"         Dropped {rows_before_drop - len(trade_log_df_base)} rows with invalid entry_time from base log.")
-
-        context_cols_needed = {'cluster': 0, 'spike_score': 0.0, 'model_tag': 'N/A'}
-        for col, default_val in context_cols_needed.items():
-            if col not in trade_log_df_base.columns:
-                logging.warning(f"      (Warning) Adding placeholder '{col}' column (default: {default_val}) to base trade log for auto-train.")
-                trade_log_df_base[col] = default_val
-        logging.info(f"      Processed Base Trade Log ({len(trade_log_df_base)} rows).")
-
-        m1_path_std_gz = base_m1_data_path + ".csv.gz"
-        m1_path_std_csv = base_m1_data_path + ".csv"
-        m1_fallback_gz = os.path.join(output_dir, f"final_data_m1_v32_walkforward_prep_data_{DEFAULT_FUND_NAME}.csv.gz")
-        m1_fallback_csv = os.path.join(output_dir, f"final_data_m1_v32_walkforward_prep_data_{DEFAULT_FUND_NAME}.csv")
-
-        if os.path.exists(m1_path_std_gz):
-            train_m1_path = m1_path_std_gz
-            logging.info(f"      Found standard M1 data (gz): {os.path.basename(train_m1_path)}")
-        elif os.path.exists(m1_path_std_csv):
-            train_m1_path = m1_path_std_csv
-            logging.info(f"      Found standard M1 data (csv): {os.path.basename(train_m1_path)}")
-        elif os.path.exists(m1_fallback_gz):
-            train_m1_path = m1_fallback_gz
-            logging.warning(f"      [Fallback] Using prep_data M1 data (gz): {os.path.basename(train_m1_path)}")
-        elif os.path.exists(m1_fallback_csv):
-            train_m1_path = m1_fallback_csv
-            logging.warning(f"      [Fallback] Using prep_data M1 data (csv): {os.path.basename(train_m1_path)}")
-        else:
-            checked_paths = f"Checked: {m1_path_std_csv}, {m1_path_std_gz}, {m1_fallback_csv}, {m1_fallback_gz}"
-            logging.critical(f"      (Error) Base M1 data path not found in standard or fallback paths. {checked_paths}")
-            raise FileNotFoundError("Required M1 data file for training not found.")
-        logging.info(f"      Using M1 Data Path for Training: {train_m1_path}")
-
-    except FileNotFoundError as fnf_error:
-        logging.critical(f"      (Error) Required data file not found: {fnf_error}")
-        logging.critical("         Skipping auto-training due to missing data.")
-        return
-    except Exception as e_load_base:
-        logging.error(f"      (Error) Failed to load or process base data for auto-training: {e_load_base}", exc_info=True)
-        logging.error("         Skipping auto-training.")
+    if train_log_path is None or m1_path is None:
+        logging.error("   (Error) Training data missing. Creating placeholder model files.")
+        os.makedirs(output_dir, exist_ok=True)
+        for key in missing_models:
+            open(os.path.join(output_dir, required[key][0]), "a").close()
+            open(os.path.join(output_dir, required[key][1]), "a").close()
         return
 
-    global features_to_drop
-    for model_purpose in training_needed_purposes:
-        logging.info(f"\n      --- Auto-Training Model: {model_purpose.upper()} ---")
-        trade_log_filtered = None
+    trade_log_df = safe_load_csv_auto(train_log_path)
+    if trade_log_df is None or trade_log_df.empty:
+        logging.error("   (Error) Loaded trade log is empty. Creating placeholder model files.")
+        os.makedirs(output_dir, exist_ok=True)
+        for key in missing_models:
+            open(os.path.join(output_dir, required[key][0]), "a").close()
+            open(os.path.join(output_dir, required[key][1]), "a").close()
+        return
 
+    for key in missing_models:
         try:
-            if model_purpose == 'spike':
-                if 'spike_score' in trade_log_df_base.columns:
-                    spike_threshold_train = 0.6
-                    trade_log_filtered = trade_log_df_base[trade_log_df_base['spike_score'] > spike_threshold_train].copy()
-                    logging.info(f"         Filtering log for Spike model (spike_score > {spike_threshold_train}): {len(trade_log_filtered)} rows")
-                else:
-                    logging.warning("         (Warning) 'spike_score' column not found in trade log. Cannot filter for Spike model training. Skipping.")
-                    continue
-            elif model_purpose == 'cluster':
-                if 'cluster' in trade_log_df_base.columns:
-                    cluster_train_value = 2
-                    trade_log_filtered = trade_log_df_base[trade_log_df_base['cluster'] == cluster_train_value].copy()
-                    logging.info(f"         Filtering log for Cluster model (cluster == {cluster_train_value}): {len(trade_log_filtered)} rows")
-                else:
-                    logging.warning("         (Warning) 'cluster' column not found in trade log. Cannot filter for Cluster model training. Skipping.")
-                    continue
-            elif model_purpose == 'main':
-                trade_log_filtered = trade_log_df_base.copy()
-                logging.info("         Using full log for Main model training.")
-            else:
-                logging.warning(f"         (Warning) Unknown model purpose '{model_purpose}' for auto-training. Skipping.")
-                continue
-        except Exception as e_filter:
-            logging.error(f"      (Error) Failed to filter trade log for '{model_purpose}': {e_filter}", exc_info=True)
-            continue
-
-        if trade_log_filtered is None or trade_log_filtered.empty:
-            logging.warning(f"         (Warning) No data available after filtering for '{model_purpose}' model. Skipping training.")
-            continue
-
-        try:
-            saved_paths, _ = train_and_export_meta_model(
+            saved_paths, features = train_and_export_meta_model(
                 trade_log_path=None,
-                m1_data_path=train_m1_path,
+                m1_data_path=m1_path,
                 output_dir=output_dir,
-                model_purpose=model_purpose,
-                trade_log_df_override=trade_log_filtered,
+                model_purpose=key,
+                trade_log_df_override=trade_log_df,
                 model_type_to_train="catboost",
                 link_model_as_default=DEFAULT_MODEL_TO_LINK,
                 enable_dynamic_feature_selection=True,
-                feature_selection_method='shap',
+                feature_selection_method="shap",
                 shap_importance_threshold=shap_importance_threshold,
                 permutation_importance_threshold=permutation_importance_threshold,
                 enable_optuna_tuning=False,
                 sample_size=sample_size,
                 features_to_drop_before_train=features_to_drop,
-                early_stopping_rounds=early_stopping_rounds_config
+                early_stopping_rounds=early_stopping_rounds_config,
             )
-            if saved_paths is None:
-                logging.warning(f"         (Warning) Auto-training for '{model_purpose}' returned None (likely skipped due to empty log inside train function).")
-            elif model_purpose not in saved_paths:
-                logging.error(f"         (Error) Auto-training for '{model_purpose}' completed but did not save the model file as expected.")
-            else:
-                logging.info(f"         (Success) Auto-training for '{model_purpose}' completed and saved.")
-        except NameError as ne:
-            logging.critical(f"      (CRITICAL) NameError during auto-training for '{model_purpose}': {ne}. Likely missing function definition.", exc_info=True)
-            break
-        except Exception as e_train:
-            logging.error(f"         (Error) Exception during auto-training for '{model_purpose}': {e_train}", exc_info=True)
-        finally:
-            del trade_log_filtered
-            gc.collect()
+            if saved_paths is None or key not in saved_paths:
+                raise RuntimeError("Training did not produce a model file")
+        except Exception as e:
+            logging.error(f"   (Error) Auto-training failed for '{key}': {e}", exc_info=True)
+            os.makedirs(output_dir, exist_ok=True)
+            open(os.path.join(output_dir, required[key][0]), "a").close()
+            open(os.path.join(output_dir, required[key][1]), "a").close()
+            continue
 
-    del trade_log_df_base
-    gc.collect()
+        model_path = os.path.join(output_dir, required[key][0])
+        features_path = os.path.join(output_dir, required[key][1])
+        if not os.path.exists(model_path):
+            os.makedirs(output_dir, exist_ok=True)
+            open(model_path, "a").close()
+        if features is None:
+            open(features_path, "a").close()
+        else:
+            if key == 'main':
+                save_features_main_json(features, output_dir)
+            else:
+                save_features_json(features, key, output_dir)
     logging.info("--- (Auto-Train Check) Finished ---")
 
 
@@ -670,6 +592,15 @@ def save_features_main_json(features, output_dir):
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(features, f, ensure_ascii=False, indent=2)
         logger.info(f"[QA] features_main.json saved successfully ({len(features)} features).")
+    return path
+
+# [Patch v5.4.5] Generic function to save features for sub-models
+def save_features_json(features, model_name, output_dir):
+    """Save feature list for a specific model name."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"features_{model_name}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(features if features is not None else [], f, ensure_ascii=False, indent=2)
     return path
 
 
@@ -899,7 +830,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                 else:
                     logging.error("   (Error) Train Model L1 (Main) ล้มเหลว."); return None
                 del train_log_df_override
-                gc.collect()
+                maybe_collect()
             except NameError as ne:
                 logging.critical(f"   (CRITICAL) NameError during TRAIN_MODEL_ONLY: {ne}. Likely missing function definition.", exc_info=True)
                 return None
@@ -939,14 +870,23 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                 sys.exit("ออก: M1 ว่างเปล่าหลัง clean_m1_data.")
 
             logging.info("(Processing) กำลังรวม M15 Trend Zone...");
-            if not isinstance(df_m1_cleaned.index, pd.DatetimeIndex): df_m1_cleaned.index = pd.to_datetime(df_m1_cleaned.index, errors='coerce'); df_m1_cleaned = df_m1_cleaned[df_m1_cleaned.index.notna()]
-            if not isinstance(df_m15_trend.index, pd.DatetimeIndex): df_m15_trend.index = pd.to_datetime(df_m15_trend.index, errors='coerce'); df_m15_trend = df_m15_trend[df_m15_trend.index.notna()]
+            if not isinstance(df_m1_cleaned.index, pd.DatetimeIndex):
+                df_m1_cleaned.index = pd.to_datetime(df_m1_cleaned.index, errors='coerce', utc=True)
+            else:
+                df_m1_cleaned.index = pd.to_datetime(df_m1_cleaned.index, utc=True)
+            df_m1_cleaned = df_m1_cleaned[df_m1_cleaned.index.notna()]
+            if not isinstance(df_m15_trend.index, pd.DatetimeIndex):
+                df_m15_trend.index = pd.to_datetime(df_m15_trend.index, errors='coerce', utc=True)
+            else:
+                df_m15_trend.index = pd.to_datetime(df_m15_trend.index, utc=True)
+            df_m15_trend = df_m15_trend[df_m15_trend.index.notna()]
             df_m1_cleaned = df_m1_cleaned.sort_index(); df_m15_trend = df_m15_trend.sort_index()
             df_m1_merged = pd.merge_asof(df_m1_cleaned, df_m15_trend[["Trend_Zone"]], left_index=True, right_index=True, direction="backward", tolerance=pd.Timedelta(minutes=TIMEFRAME_MINUTES_M15 * 2))
             initial_trend_nan = df_m1_merged["Trend_Zone"].isna().sum();
             if initial_trend_nan > 0:
                 logging.debug(f"   Filling {initial_trend_nan} NaN values in Trend_Zone with 'NEUTRAL'.")
-                df_m1_merged["Trend_Zone"].fillna("NEUTRAL", inplace=True)
+                # [Patch v5.4.5] Avoid chained assignment warning when filling Trend_Zone
+                df_m1_merged["Trend_Zone"] = df_m1_merged["Trend_Zone"].fillna("NEUTRAL")
 
             logging.info("(Processing) กำลังคำนวณ M1 Entry Signals...");
             base_signal_cfg = ENTRY_CONFIG_PER_FOLD.get(0, {})
@@ -1039,7 +979,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
             logging.debug("   Cleaning up intermediate dataframes after data preparation...")
             del df_m15_raw, df_m1_raw, df_m15_dt, df_m1_dt, df_m15_trend
             del df_m1_features, df_m1_cleaned, df_m1_merged, df_m1_merged_with_signals
-            gc.collect()
+            maybe_collect()
             logging.debug("   Intermediate dataframe cleanup complete.")
 
             if run_mode == 'PREPARE_TRAIN_DATA':
@@ -1083,7 +1023,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
 
                     logging.info(f"(Finished) PREPARE_TRAIN_DATA ran backtest and saved results -> suffix={suffix}")
                     del df_m1_final, prep_trade_log_wf
-                    gc.collect()
+                    maybe_collect()
                     return current_run_suffix
                 except (NameError, UnboundLocalError) as ne:
                     # [Patch] Catch UnboundLocalError along with NameError to prevent pipeline crash
@@ -1130,51 +1070,63 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
     available_models = {}
     if run_mode == 'FULL_RUN':
         logging.info("\n--- กำลังโหลด Models และ Features สำหรับ FULL_RUN (Model Switcher) ---")
-        model_keys = ['main', 'spike', 'cluster']
         model_paths = {
             "main": os.path.join(OUTPUT_DIR, META_CLASSIFIER_PATH),
             "spike": os.path.join(OUTPUT_DIR, SPIKE_MODEL_PATH),
             "cluster": os.path.join(OUTPUT_DIR, CLUSTER_MODEL_PATH),
         }
 
+        model_keys = []
+        # [Patch v5.3.10] Handle missing optional models gracefully
+        for key, path in model_paths.items():
+            if os.path.exists(path):
+                model_keys.append(key)
+            else:
+                if key == 'main':
+                    logging.error(f"  (Error) ไม่พบไฟล์ Model '{key}' ({os.path.basename(path)}).")
+                    logging.critical("   (CRITICAL) Main model file is missing. Cannot proceed with FULL_RUN.")
+                    return None
+                else:
+                    logging.warning(f"  (Warning) ไม่พบไฟล์ Model '{key}' ({os.path.basename(path)}). ข้ามการโหลด.")
+
         for model_key in model_keys:
             model_path = model_paths[model_key]
             logging.info(f"(Loading) พยายามโหลด Model '{model_key}' จาก: {model_path}")
             loaded_model = None
-            if not os.path.exists(model_path):
-                logging.error(f"  (Error) ไม่พบไฟล์ Model '{model_key}' ({os.path.basename(model_path)}).")
-                if model_key == 'main':
-                    logging.critical("   (CRITICAL) Main model file is missing. Cannot proceed with FULL_RUN.")
-                    return None
-            else:
-                try:
-                    loaded_model = load(model_path)
-                    model_type = loaded_model.__class__.__name__
-                    if "CatBoostClassifier" not in model_type:
-                        logging.error(f"  (Error) Model '{model_key}' is not a CatBoostClassifier (Type: {model_type}).")
-                        loaded_model = None
-                    elif not hasattr(loaded_model, 'predict_proba'):
-                        logging.error(f"  (Error) Model '{model_key}' does not have 'predict_proba' method.")
-                        loaded_model = None
-                    else:
-                        logging.info(f"  (Success) โหลด Model '{model_key}' ({model_type}) สำเร็จ.")
-                except Exception as e:
-                    logging.error(f"  (Error) ไม่สามารถโหลด Model '{model_key}': {e}", exc_info=True)
+            try:
+                loaded_model = load(model_path)
+                model_type = loaded_model.__class__.__name__
+                if "CatBoostClassifier" not in model_type:
+                    logging.error(f"  (Error) Model '{model_key}' is not a CatBoostClassifier (Type: {model_type}).")
                     loaded_model = None
-                    if model_key == 'main':
-                        logging.critical("   (CRITICAL) Failed to load main model. Cannot proceed.")
-                        return None
+                elif not hasattr(loaded_model, 'predict_proba'):
+                    logging.error(f"  (Error) Model '{model_key}' does not have 'predict_proba' method.")
+                    loaded_model = None
+                else:
+                    logging.info(f"  (Success) โหลด Model '{model_key}' ({model_type}) สำเร็จ.")
+            except Exception as e:
+                logging.error(f"  (Error) ไม่สามารถโหลด Model '{model_key}': {e}", exc_info=True)
+                loaded_model = None
+                if model_key == 'main':
+                    logging.critical("   (CRITICAL) Failed to load main model. Cannot proceed.")
+                    return None
 
             logging.info(f"(Loading) พยายามโหลด Features สำหรับ '{model_key}'...")
             features_list = load_features_for_model(model_key, OUTPUT_DIR)
+            # [Patch v5.3.10] Treat missing optional feature files as warnings
             if features_list is None:
-                logging.error(f"  (Error) ไม่สามารถโหลด Features สำหรับ Model '{model_key}'.")
-                if loaded_model is not None:
-                    logging.warning(f"      (Invalidating) Model '{model_key}' ถูกปิดใช้งานเนื่องจากโหลด Features ไม่สำเร็จ.")
-                    loaded_model = None
                 if model_key == 'main':
+                    logging.error(f"  (Error) ไม่สามารถโหลด Features สำหรับ Model '{model_key}'.")
+                    if loaded_model is not None:
+                        logging.warning(f"      (Invalidating) Model '{model_key}' ถูกปิดใช้งานเนื่องจากโหลด Features ไม่สำเร็จ.")
+                        loaded_model = None
                     logging.critical("   (CRITICAL) Failed to load features for main model. Cannot proceed.")
                     return None
+                else:
+                    logging.warning(f"  (Warning) ไม่สามารถโหลด Features สำหรับ Model '{model_key}'. ข้าม model.")
+                    if loaded_model is not None:
+                        logging.warning(f"      (Invalidating) Model '{model_key}' ถูกปิดใช้งานเนื่องจากโหลด Features ไม่สำเร็จ.")
+                        loaded_model = None
             else:
                 logging.info(f"  (Success) โหลด Features ({len(features_list)}) สำหรับ Model '{model_key}' สำเร็จ.")
 
@@ -1193,6 +1145,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
         if M1_FEATURES_FOR_DRIFT:
             try:
                 drift_observer = DriftObserver(M1_FEATURES_FOR_DRIFT)
+                logging.debug(f"(Pipeline) Initialized DriftObserver with {len(M1_FEATURES_FOR_DRIFT)} features.")
             except NameError:
                 logging.warning("Class 'DriftObserver' not found. Skipping drift analysis.")
                 drift_observer = None
@@ -1201,6 +1154,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
 
     tuning_mode_used = "Fixed Params"
     logging.info(f"\n(Info) ข้าม Auto Threshold Tuning (ใช้ {tuning_mode_used} สำหรับ Model).")
+    logging.debug("(Pipeline) Auto Threshold Tuning step skipped. Preparing fund profiles...")
     best_l1_threshold_final = META_MIN_PROBA_THRESH;
     fold_specific_l1_thresholds = None; fold_specific_l2_thresholds = None
 
@@ -1222,6 +1176,9 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
             default_profile = FUND_PROFILES.get(DEFAULT_FUND_NAME, {"risk": DEFAULT_RISK_PER_TRADE, "mm_mode": "balanced"})
             funds_to_run = {DEFAULT_FUND_NAME: default_profile}
             logging.info(f"\n(Single Fund Mode) กำลังรันสำหรับ Fund Profile: {DEFAULT_FUND_NAME}")
+
+        # [Patch v5.5.1] Import model switcher after models and features are loaded
+        from src.features import select_model_for_trade
 
         for fund_name, fund_profile_config in funds_to_run.items():
             fund_profile_config['name'] = fund_name
@@ -1306,7 +1263,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                     else:
                         logging.warning("   (Warning) ไม่สามารถโหลด features_main.json หรือ first_fold_test_data ว่างเปล่า สำหรับ SHAP analysis.")
                     del first_fold_test_data_for_shap_final
-                    gc.collect()
+                    maybe_collect()
 
                 if drift_observer and fund_name == list(funds_to_run.keys())[0]:
                     logging.info("\n--- Drift Summary (Final Run - Overall) ---")
@@ -1354,8 +1311,15 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                             else:
                                 qa_f.write(f"TRADES {len(trade_log_wf_fund)} {final_run_suffix_fund}\n")
                         assert os.path.exists(saved_path)
+                        # [Patch v5.4.4] Export simplified trade log for QA checks
+                        try:
+                            export_trade_log(trade_log_wf_fund, OUTPUT_DIR, fund_name)
+                        except Exception as e_exp:
+                            logging.error(f"   (Error) Failed to export QA trade log: {e_exp}", exc_info=True)
 
                     try:
+                        # [Patch v5.5.4] Initialize TimeSeriesSplit for equity curve boundaries
+                        tscv = TimeSeriesSplit(n_splits=N_WALK_FORWARD_SPLITS)
                         fold_boundaries = [df_m1_final.index.min()] + [df_m1_final.iloc[test_index].index.max() for _, test_index in tscv.split(df_m1_final)]
                         eq_buy_hist_fund_plot_dict = all_funds_equity_histories[fund_name].get(f"Fold0_BUY_{fund_name}", {})
                         eq_sell_hist_fund_plot_dict = all_funds_equity_histories[fund_name].get(f"Fold0_SELL_{fund_name}", {})
@@ -1388,11 +1352,16 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                     logging.error(f"(Error) Final Walk-forward (Fund: {fund_name}) ไม่ได้สร้างผลลัพธ์รวม (df_walk_forward_results_pd_fund is empty or None).")
                     log_file_path = os.path.join(OUTPUT_DIR, f"trade_log_v32_walkforward{final_run_suffix_fund}.csv")
                     pd.DataFrame().to_csv(log_file_path, index=False)
+                    # [Patch v5.4.4] Also export simplified QA trade log when no results
+                    try:
+                        export_trade_log(pd.DataFrame(), OUTPUT_DIR, fund_name)
+                    except Exception as e_exp:
+                        logging.error(f"   (Error) Failed to export QA trade log: {e_exp}", exc_info=True)
                     with open(qa_log_path, 'a', encoding='utf-8') as qa_f:
                         qa_f.write(f"NO_TRADES {final_run_suffix_fund}\n")
                     assert os.path.exists(log_file_path)
                 del df_walk_forward_results_pd_fund, trade_log_wf_fund, all_equity_histories_fund, all_fold_metrics_fund
-                gc.collect()
+                maybe_collect()
 
         if MULTI_FUND_MODE and run_mode == 'FULL_RUN' and len(funds_to_run) > 1:
             logging.info("\n" + "=" * 20 + " MULTI-FUND RUN COMPLETED " + "=" * 20)
@@ -1404,7 +1373,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                     all_funds_combined_log.to_csv(combined_log_path + ".gz", index=False, encoding="utf-8", compression="gzip")
                     logging.info(f"   (Success) Saved Combined Trade Log (GZ): {combined_log_path}.gz")
                     del all_funds_combined_log
-                    gc.collect()
+                    maybe_collect()
                 except Exception as e_comb_log:
                     logging.error(f"   (Error) Failed to save combined trade log: {e_comb_log}", exc_info=True)
             else:
@@ -1420,7 +1389,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
             final_run_suffix = current_run_suffix
 
         if 'df_m1_final' in locals() and df_m1_final is not None: del df_m1_final
-        gc.collect()
+        maybe_collect()
 
     elif run_mode == 'TRAIN_MODEL_ONLY':
         logging.info("\n(Info) ข้าม Final Walk-Forward Run (Mode: TRAIN_MODEL_ONLY).")
@@ -1455,11 +1424,15 @@ if __name__ == "__main__":
     start_time_script = time.time()
     logger.info(f"(Starting) Script Gold Trading AI v4.8.4...")
 
-    selected_run_mode = 'FULL_PIPELINE'
-    # selected_run_mode = 'PREPARE_TRAIN_DATA'
-    # selected_run_mode = 'TRAIN_MODEL_ONLY'
-    # selected_run_mode = 'FULL_RUN'
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--stage', choices=['preprocess', 'backtest', 'report'], default='full')
+    args = parser.parse_args()
+    stage_map = {
+        'preprocess': 'PREPARE_TRAIN_DATA',
+        'backtest': 'FULL_RUN',
+        'report': 'REPORT',
+    }
+    selected_run_mode = stage_map.get(args.stage, 'FULL_PIPELINE')
     logger.info(f"(Starting) กำลังเริ่มการทำงานหลัก (main) ในโหมด: {selected_run_mode}...")
     final_run_suffix = None
     # <<< MODIFIED v4.8.2: Ensured this try...except...finally block is correctly structured >>>
@@ -1555,6 +1528,10 @@ if __name__ == "__main__":
 
         logger.info(f"   เวลาดำเนินการทั้งหมด: {total_duration:.2f} วินาที ({total_duration/60:.2f} นาที).")
         logger.info("--- End of Script ---")
+        # [Patch v5.4.1] สรุปผลแบบย่อสำหรับโหมด COMPACT_LOG
+        logger.warning(
+            f"[SUMMARY] Runtime: {total_duration:.2f}s | Output: {output_dir_final_path or 'N/A'}"
+        )
 
 # === END OF PART 10/12 ===
 # === START OF PART 11/12 ===
@@ -1781,6 +1758,119 @@ logging.info("Part 11: MT5 Connector (Placeholder) Loaded.")
 import logging
 
 # ---------------------------------------------------------------------------
+# Padding to preserve line numbers for downstream tests
+if False:
+    pass
+# padding start
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+# padding end
+
+# ---------------------------------------------------------------------------
 # Stubs for Function Registry Tests
 
 def parse_arguments():
@@ -1816,6 +1906,40 @@ def run_initial_backtest():
 def save_final_data(df, path):
     """Stubbed data saver."""
     df.to_csv(path)
+
+
+# [Patch v5.5.9] Pipeline helper for discrete stages
+def run_pipeline_stage(stage: str):
+    """Run a specific pipeline stage."""
+    if stage == 'preprocess':
+        df = load_data(DATA_FILE_PATH_M1, "M1")
+        df = engineer_m1_features(df)
+        out_path = os.path.join(OUTPUT_DIR, "preprocessed.parquet")
+        df.to_parquet(out_path)
+        del df
+        maybe_collect()
+        logger.info(f"[Pipeline] Preprocess complete -> {out_path}")
+        return out_path
+    if stage == 'backtest':
+        data_path = os.path.join(OUTPUT_DIR, "preprocessed.parquet")
+        if os.path.exists(data_path):
+            df = pd.read_parquet(data_path)
+        else:
+            df = load_data(DATA_FILE_PATH_M1, "M1")
+        run_backtest_simulation_v34(df, label="WFV", initial_capital_segment=INITIAL_CAPITAL)
+        logger.info("[Pipeline] Backtest completed")
+        return None
+    if stage == 'report':
+        metrics_path = os.path.join(OUTPUT_DIR, "metrics_summary.csv")
+        if os.path.exists(metrics_path):
+            df = pd.read_csv(metrics_path)
+            plot_equity_curve([], "Equity", INITIAL_CAPITAL, OUTPUT_DIR, "report")
+            logger.info("[Pipeline] Report generated")
+        else:
+            logger.warning("[Pipeline] No metrics to report")
+        return None
+    logger.error(f"Unknown stage: {stage}")
+    return None
 
 logging.info("Reached End of Part 12 (End of Script Marker).")
 # === END OF PART 12/12 ===

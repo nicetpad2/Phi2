@@ -1,3 +1,249 @@
+### 2025-10-07
+- [Patch v5.7.2] Fix sweep path to absolute for Colab execution
+- New/Updated unit tests added for tests.test_projectp_cli
+- QA: pytest -q passed (370 tests)
+
+### 2025-10-08
+
+- [Patch v5.7.3] Log reasons when folds have no trades
+- New/Updated unit tests added for tests.test_empty_summary
+
+- QA: pytest -q passed
+
+### 2025-10-06
+
+- [Patch v5.6.8] Handle empty trade logs and lower default ML threshold
+- New/Updated unit tests added for tests.test_empty_summary and tests.test_function_registry
+- QA: pytest -q passed (364 tests)
+
+### 2025-10-06
+- [Patch v5.7.1] Lower default signal score threshold and enable meta filter toggle
+- New/Updated unit tests added for tests.test_config_defaults
+- QA: pytest -q passed (363 tests)
+
+### 2025-10-06
+- [Patch v5.6.8] Add needs_retrain method and retrain warning logic
+- New/Updated unit tests added for tests.test_drift_retrain_logic
+- QA: pytest -q failed (6 failed)
+
+
+### 2025-10-05
+- [Patch v5.6.7] Add config toggle for soft cooldown and relax thresholds
+- New/Updated unit tests added for tests.test_config_defaults
+- QA: pytest -q passed (363 tests)
+
+### 2025-09-02
+
+- [Patch v5.6.5] Relax soft cooldown conditions and shorten cooldown duration
+- New/Updated unit tests added for cooldown_utils and strategy
+- QA: pytest -q passed (351 tests)
+
+
+### 2025-09-03
+- [Patch v5.6.6] Update soft cooldown logic with side filter
+- New/Updated unit tests added for tests.test_soft_cooldown_logic
+- QA: pytest -q passed
+
+### 2025-09-04
+- [Patch v5.6.7] เพิ่มพารามิเตอร์ trade_log_path และ m1_path ให้ hyperparameter_sweep
+- New/Updated unit tests added for none (existing coverage)
+- QA: pytest -q passed (363 tests)
+
+### 2025-09-01
+- [Patch v5.6.4] Fix boundary logic for session tagging and reduce duplicate warnings
+- New/Updated unit tests added for tests.test_sessions_utils
+- QA: pytest -q passed
+
+### 2025-06-04
+- [Patch v5.6.5] Add volatility filter to entry logic
+- New/Updated unit tests added for tests.test_namedtuple_row and tests.test_volatility_filter
+- QA: pytest -q passed
+
+### 2025-08-31
+
+- [Patch v5.6.4] Extend Asia session to 22-8 and update tests
+- QA: pytest -q passed
+
+
+#
+### 2025-08-30
+- [Patch v5.6.3] Reduce log spam for out-of-session timestamps
+- QA: pytest -q passed (347 tests)
+### 2025-08-29
+- [Patch v5.6.2] Remove PyTables dependency for feature persistence
+- Fix FutureWarning in check_data_quality
+- New/Updated unit tests added for tests.test_features_hdf5
+- QA: pytest -q passed (347 tests)
+### 2025-08-28
+- [Patch v5.6.1] Improve model utilities
+- New/Updated unit tests added for tests.test_model_utils_new
+- QA: pytest -q passed (325 tests)
+
+### 2025-08-28
+
+- [Patch v5.6.1] Add dataclass-based order logging with rotating file support
+- New/Updated unit tests added for tests.test_trade_logger
+- QA: pytest -q passed (325 tests)
+
+
+### 2025-08-26
+- [Patch v5.6.0] Refactor font setup and CSV loader
+- New/Updated unit tests added for data_loader
+- QA: pytest -q passed (325 tests)
+
+
+### 2025-08-27
+- [Patch v5.6.1] Refactor cooldown state management
+- New/Updated unit tests added for cooldown_utils
+
+- QA: pytest -q passed (333 tests)
+
+
+### 2025-08-25
+
+
+### 2025-08-27
+- [Patch v5.5.16] Enhance log_analysis utilities
+- New/Updated unit tests added for tests.test_log_analysis
+- QA: pytest -q passed (325 tests)
+
+### 2025-08-25
+- [Patch v5.5.15] Improve data_loader timezone handling and add data quality checks
+- New/Updated unit tests added for data_loader
+
+
+- QA: pytest -q passed
+
+### 2025-08-24
+- [Patch v5.5.14] Refactor ProjectP CLI and add logging config
+- New/Updated unit tests added for tests.test_projectp_cli
+- QA: pytest -q passed (310 tests)
+
+### 2025-08-25
+- [Patch v5.5.15] Improve walk-forward validation utilities
+- New/Updated unit tests added for tests.test_wfv_utils
+- QA: pytest -q passed
+
+### 2025-08-23
+- [Patch v5.5.13] Optimize DataFrame writes in backtest
+- QA: pytest -q passed (309 tests)
+
+### 2025-08-24
+
+- [Patch v5.5.9] Add profiling option for backtest
+- New/Updated unit tests added for profile_backtest, main_pipeline_cli
+
+- QA: pytest -q passed
+
+
+### 2025-08-22
+- [Patch v5.5.12] Add alert summary utilities in log_analysis
+- New/Updated unit tests added for tests.test_log_analysis
+- QA: pytest -q passed
+
+### 2025-08-21
+- [Patch v5.5.9] Add pipeline CLI and threshold optimization script
+- New/Updated unit tests added for tests.test_threshold_optimization, tests.test_main_pipeline_cli
+- QA: pytest -q passed
+
+### 2025-08-21
+- [Patch v5.5.10] Extend ProjectP CLI with sweep and threshold modes
+- New/Updated unit tests added for tests.test_projectp_cli
+- QA: pytest -q passed
+
+### 2025-06-04
+- [Patch v5.5.11] Fix pandas fillna FutureWarning and multiprocessing warning
+- QA: pytest -q passed (308 tests)
+
+
+### 2025-08-20
+
+- [Patch v5.5.8] Improve OMS Guardian with breakeven and SL/TP validation
+- New/Updated unit tests added for oms guardian helpers
+- QA: pytest -q passed (292 tests)
+
+
+
+### 2025-08-13
+
+- [Patch v5.5.7] Add ATR-based position sizing
+- New/Updated unit tests added for src.adaptive
+- QA: pytest -q passed (278 tests)
+
+### 2025-08-13
+- [Patch v5.5.7] Add dynamic lot sizing via drawdown
+- New/Updated unit tests added for adaptive module
+
+- QA: pytest -q passed
+### 2025-06-04
+- [Patch v5.5.8] Implement trailing ATR stop and partial TP defaults
+- New/Updated unit tests added for adaptive module
+- QA: pytest -q passed
+
+
+### 2025-08-14
+- [Patch v5.5.7] Implement volume spike filter
+- New/Updated unit tests added for volume spike and registry
+- QA: pytest -q passed
+
+### 2025-08-14
+- [Patch v5.5.7] Add MACD divergence detection and filter for buy signals
+- New/Updated unit tests added for features and strategy signals
+- QA: pytest -q passed
+
+### 2025-06-04
+- [Patch v5.5.7] Add log analysis utilities and risk management helper
+- New/Updated unit tests added for tests.test_log_analysis
+
+- QA: pytest -q passed (280 tests)
+
+
+### 2025-08-12
+- [Patch v5.5.6] Force COMPACT_LOG in tests, add summary
+- New/Updated unit tests added for tests.conftest
+- QA: pytest -q passed (277 tests)
+
+### 2025-08-11
+- [Patch v5.5.4] Fix SHAP lag feature evaluation dataset
+- QA: pytest -q passed (265 tests)
+
+### 2025-08-11
+- [Patch v5.5.5] Add environment override for drift threshold
+- New/Updated unit tests added for tests.test_env_utils
+- QA: pytest -q passed (266 tests)
+
+
+### 2025-08-10
+- [Patch v5.5.3] Update expected line numbers for stub functions
+- New/Updated unit tests added for tests.test_function_registry
+
+- QA: pytest -q passed (265 tests)
+
+### 2025-08-11
+- [Patch v5.5.4] Add environment override for drift threshold
+- New/Updated unit tests added for tests.test_env_utils
+- QA: pytest -q passed (266 tests)
+
+### 2025-08-09
+- [Patch v5.5.2] Adjust kill switch thresholds and add warnings
+- New/Updated unit tests added for src.strategy and main
+- QA: pytest -q passed (259 tests)
+
+### 2025-08-08
+- [Patch v5.4.5] Update features_main.json with default features
+- QA: pytest -q (partial)
+### 2025-07-02
+
+[Patch v5.0.24] Improve soft cooldown logic
+New/Updated unit tests added for cooldown_utils
+QA: pytest -q passed (225 tests)
+
+
+### 2025-07-01
+[Patch v5.3.10] Handle optional models as warnings
+New/Updated unit tests added for src.main
+QA: pytest -q passed (219 tests)
+
 ### 2025-06-30
 - [Patch v5.0.23] Fix GPU logging and optuna sweep fallback
 - New/Updated unit tests added for ProjectP and hyperparameter sweep
@@ -415,8 +661,167 @@
 - New/Updated unit tests added for src.config
 - QA: pytest -q passed (210 tests)
 
-### 2025-07-14
-- [Patch v5.3.4] real_train_func accepts seed parameter for deterministic sweeps
-- New/Updated unit tests added for src.training
+### 2025-08-01
+- [Patch v5.3.4] Create missing QA audit files automatically
+- New/Updated unit tests added for tests/test_function_registry.py
+- QA: pytest -q passed (215 tests)
+
+### 2025-07-15
+- [Patch v5.3.5] Adjust OMS & Logging defaults for risk management and QA
+- New/Updated unit tests added for src.config
 - QA: pytest -q passed
 
+### 2025-07-15
+- [Patch v5.3.5] Add QA log summary for trade log export
+- New/Updated unit tests added for src.utils.trade_logger
+- QA: pytest -q passed
+
+### 2025-07-15
+
+- [Patch v5.3.5] QA logging: fold summary, NaN/Inf catch, critical alerts
+- New/Updated unit tests added for src.strategy
+- QA: pytest -q passed
+
+### 2025-07-16
+
+- [Patch v5.3.6] Harden Colab detection to avoid mount errors
+- New/Updated unit tests added for src.config and registry
+- QA: pytest -q passed
+
+### 2025-08-02
+- [Patch v5.3.7] Improve Colab detection logic
+- New/Updated unit tests added for src.config
+
+### 2025-08-03
+- [Patch v5.3.8] Update registry line numbers for main stubs
+- New/Updated unit tests added for tests.test_function_registry
+- QA: pytest -q passed (219 tests)
+
+
+
+
+- [Patch v5.3.5] Skip loading absent models in FULL_RUN
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed (218 tests)
+
+
+### 2025-06-04
+- [Patch v5.3.8] Improve logger propagation and refine is_colab detection
+- New/Updated unit tests added for src.config and tests
+- QA: pytest -q passed (219 tests)
+### 2025-06-04
+- [Patch v5.3.9] Adaptive signal score entry threshold with rolling quantile
+- New/Updated unit tests added for src.strategy and tests.test_adaptive_signal_threshold
+- QA: pytest -q passed (224 tests)
+
+
+
+### 2025-08-04
+- [Patch v5.4.0] Add adaptive risk and SL/TP utilities
+- New/Updated unit tests added for src.adaptive
+- QA: pytest -q passed (219 tests)
+
+
+
+- [Patch v5.4.1] Improve coverage to 100%
+- New/Updated unit tests added for src.adaptive, feature_analysis, sessions
+
+
+
+### 2025-06-04
+- [Patch v5.4.2] Fix FUND_PROFILES defaults and auto-train fallback
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed (225 tests)
+
+
+### 2025-08-06
+- [Patch v5.4.3] Filter sweep kwargs to avoid TypeError
+- New/Updated unit tests added for hyperparameter sweep filtering
+- QA: pytest -q passed (236 tests)
+
+
+### 2025-08-07
+
+- [Patch v5.4.4] Simplify ensure_model_files_exist with placeholders
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed (236 tests)
+
+
+### 2025-08-08
+
+- [Patch v5.4.5] Validate final M1 data loading and timezone alignment
+- New/Updated unit tests added for data_loader and function_registry
+- QA: pytest -q passed (251 tests)
+
+
+### 2025-06-04
+- [Patch v5.4.6] Move sweep module to tuning, adjust cooldown defaults, add docs/README
+- New/Updated unit tests added for tests.test_hyperparameter_sweep_cli, tests.test_soft_cooldown_logic
+- QA: pytest -q passed
+### 2025-06-04
+- [Patch v5.4.7] Update line numbers in function registry test
+- New/Updated unit tests added for tests.test_function_registry
+- QA: pytest -q passed (258 tests)
+### 2025-06-04
+
+- [Patch v5.4.8] Suppress duplicate adaptive signal threshold logs
+- New/Updated unit tests added for tests.test_function_registry
+
+- QA: pytest -q passed (258 tests)
+
+
+### 2025-06-04
+- [Patch v5.4.9] Check for IPython kernel before mounting Google Drive
+- New/Updated unit tests added for src.config and tests.test_is_colab
+
+- QA: pytest -q passed (258 tests)
+### 2025-06-05
+- [Patch v5.5.0] Improve config fallbacks and model file handling
+- New/Updated unit tests added for existing suites
+- QA: pytest -q passed (258 tests)
+
+
+### 2025-06-04
+- [Patch v5.4.7] Tune MetaClassifier threshold
+- New/Updated unit tests added for evaluation and strategy
+- QA: pytest -q passed (260 tests)
+
+- [Patch v5.5.1] Enable automatic library installation
+- New/Updated unit tests added for src.config
+
+- QA: pytest -q passed (258 tests)
+
+
+
+### 2025-06-06
+- [Patch v5.5.2] Handle missing entry index with nearest lookup
+- New/Updated unit tests added for strategy helper
+- QA: pytest -q passed
+
+### 2025-06-07
+
+- [Patch v5.5.4] Add configurable RSI drift override threshold
+- New/Updated unit tests added for config and registry
+
+- QA: pytest -q passed (266 tests)
+
+### 2025-06-08
+- [Patch v5.5.5] Persist default SESSION_TIMES_UTC in utils.sessions
+- QA: pytest -q passed
+
+### 2025-06-09
+- [Patch v5.5.6] Add M15 multi-timeframe trend filter for order entry
+- New/Updated unit tests added for strategy and features
+- QA: pytest -q passed
+
+### 2025-06-10
+- [Patch v5.5.7] Vectorize equity and drawdown updates in run_backtest_simulation_v34
+- Updated unit tests line numbers for function registry
+- QA: pytest -q passed (348 tests)
+
+
+\n
+### 2025-06-04
+- [Patch v5.6.4] Add dashboard module and alert when MDD exceeds 10%
+- New/Updated unit tests added for tests.test_dashboard
+- QA: pytest -q passed

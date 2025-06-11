@@ -50,9 +50,12 @@ def test_tag_price_structure_patterns_missing_columns_warning(caplog):
     assert any('Missing columns for Pattern Labeling' in msg for msg in caplog.messages)
 
 
-def test_get_session_tag_outside_sessions_returns_other():
-    ts = pd.Timestamp('2024-01-01 23:00', tz='UTC')
-    assert features.get_session_tag(ts) == 'Other'
+def test_get_session_tag_outside_sessions_returns_na(caplog):
+    ts = pd.Timestamp('2024-01-01 21:00', tz='UTC')
+    with caplog.at_level(logging.WARNING):
+        tag = features.get_session_tag(ts)
+    assert tag == 'NY'
+    assert not any('out of all session ranges' in msg for msg in caplog.messages)
 
 
 def test_engineer_m1_features_with_lag_config_adds_columns():
@@ -83,3 +86,13 @@ def test_macd_returns_values():
     assert not line.isna().all()
     assert not signal.isna().all()
     assert not diff.isna().all()
+
+
+def test_engineer_m1_features_nan_inf_warning(caplog):
+    df = pd.DataFrame({'Open': [1.0], 'High': [np.inf], 'Low': [0.0], 'Close': [1.0]})
+    with caplog.at_level(logging.INFO):
+        result = features.engineer_m1_features(df)
+    assert not result.empty
+    # [Patch v5.5.4] QA warning should no longer appear after automatic cleaning
+    assert all('[QA WARNING] NaN/Inf detected in engineered features' not in msg for msg in caplog.messages)
+    assert any('[QA] M1 Feature Engineering Completed' in msg for msg in caplog.messages)

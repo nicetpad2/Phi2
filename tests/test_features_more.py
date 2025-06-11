@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import pandas as pd
 import pytest
+import logging
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT_DIR)
@@ -80,6 +81,23 @@ def test_clean_m1_data_basic():
     assert cleaned['Pattern_Label'].dtype.name == 'category'
 
 
+def test_calculate_m15_trend_zone_cache(caplog):
+    idx = pd.date_range('2024-01-01', periods=2, freq='15min')
+    df = pd.DataFrame({'Close': [1.0, 1.1]}, index=idx)
+    with caplog.at_level(logging.INFO):
+        first = features.calculate_m15_trend_zone(df)
+        second = features.calculate_m15_trend_zone(df)
+    assert 'cache' in ''.join(caplog.messages).lower()
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_get_mtf_sma_trend():
+    idx = pd.date_range('2024-01-01', periods=3, freq='15min')
+    df = pd.DataFrame({'Close': [1.0, 2.0, 3.0]}, index=idx)
+    trend = features.get_mtf_sma_trend(df, fast=1, slow=2, rsi_period=1, rsi_upper=70, rsi_lower=30)
+    assert trend in {'UP', 'DOWN', 'NEUTRAL'}
+
+
 def test_calculate_m1_entry_signals():
     df = pd.DataFrame(
         {
@@ -138,3 +156,43 @@ def test_engineer_m1_features_full(monkeypatch):
     assert 'session' in result.columns
     assert result['cluster'].dtype.name.startswith('int')
     assert result['session'].dtype.name == 'category'
+
+
+def test_add_momentum_features_basic():
+    df = pd.DataFrame({'Open': [1, 1, 1], 'Close': [1, 2, 3]},
+                      index=pd.date_range('2024-01-01', periods=3, freq='1min'))
+    res = features.add_momentum_features(df, windows=[2])
+    assert 'ROC_2' in res.columns
+    assert 'RSI_2' in res.columns
+
+
+def test_add_momentum_features_missing(caplog):
+    df = pd.DataFrame({'Close': [1, 2, 3]})
+    with caplog.at_level(logging.WARNING):
+        res = features.add_momentum_features(df, windows=[2])
+    assert 'missing' in ' '.join(caplog.messages).lower()
+    assert 'ROC_2' not in res
+
+
+def test_calculate_cumulative_delta_price():
+    df = pd.DataFrame({'Open': [1, 1, 1], 'Close': [2, 1, 2]},
+                      index=pd.date_range('2024-01-01', periods=3, freq='1min'))
+    res = features.calculate_cumulative_delta_price(df, window=2)
+    expected = pd.Series([1, 1, 1], index=df.index, dtype='float32')
+    pd.testing.assert_series_equal(res, expected)
+
+
+def test_merge_wave_pattern_labels(tmp_path):
+    df = pd.DataFrame({'Open': [1], 'Close': [1]},
+                      index=pd.date_range('2024-01-01', periods=1, freq='1min'))
+    log_path = tmp_path / 'wave.csv'
+    pd.DataFrame({'datetime': df.index, 'pattern_label': ['Hammer']}).to_csv(log_path, index=False)
+    res = features.merge_wave_pattern_labels(df, str(log_path))
+    assert res['Wave_Pattern'].iloc[0] == 'Hammer'
+
+
+def test_merge_wave_pattern_labels_missing(tmp_path):
+    df = pd.DataFrame({'Open': [1], 'Close': [1]},
+                      index=pd.date_range('2024-01-01', periods=1, freq='1min'))
+    res = features.merge_wave_pattern_labels(df, str(tmp_path / 'missing.csv'))
+    assert res['Wave_Pattern'].iloc[0] == 'Unknown'

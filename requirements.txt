@@ -1,14 +1,9 @@
-# === CORE DEPENDENCIES ===
-torch==2.6.0+cu124
-torchvision==0.21.0+cu124
-torchaudio==2.6.0+cu124
 pandas==2.2.2
 numpy==2.0.2
 scikit-learn==1.6.1
+catboost==1.2.8
+ta==0.11.0
+optuna>=3.0.0      # ถ้าใช้ Hyperparameter Tuning
+shap>=0.41.0       # ถ้าใช้ SHAP
+psutil>=5.9.0
 
-# === ML & FEATURE LIBRARIES ===
-catboost>=1.1.1
-ta>=0.11.0
-
-# === OPTIONAL (KEEP FOR REFERENCE) ===
-# shap  – ปล่อยให้ dynamic ติดตั้งใน runtime หาก AUTO_INSTALL_LIBS=True

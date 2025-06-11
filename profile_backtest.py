@@ -11,6 +11,7 @@ import pstats
 import sys
 import pandas as pd
 import logging
+from multiprocessing import Pool, get_context
 
 from src.strategy import run_backtest_simulation_v34
 from src.data_loader import safe_load_csv_auto
@@ -19,6 +20,31 @@ from src.config import FUND_PROFILES, DEFAULT_FUND_NAME  # [Patch v5.3.0]
 from src.training import real_train_func  # [Patch v5.3.0]
 
 logger = logging.getLogger(__name__)
+
+
+def run_profile(func, output_file: str) -> cProfile.Profile:
+    """Run ``func`` under ``cProfile`` and dump results to ``output_file``."""
+    profiler = cProfile.Profile()
+    profiler.enable()
+    func()
+    profiler.disable()
+    profiler.dump_stats(output_file)
+    return profiler
+
+
+def calculate_features_for_fold(params):
+    """Helper for multiprocessing Pool to calculate features."""
+    symbol, df = params
+    logger.info("Calculating features for %s", symbol)
+    return engineer_m1_features(df)
+
+
+def run_parallel_feature_engineering(list_of_fold_params, processes=4):
+    """Run feature engineering in parallel using multiprocessing Pool."""
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=processes) as pool:
+        results = pool.map(calculate_features_for_fold, list_of_fold_params)
+    return results
 
 
 def get_fund_profile(name: str | None) -> dict:
@@ -110,22 +136,28 @@ def profile_from_cli() -> None:
     parser.add_argument('csv', help='Path to M1 data CSV')
     parser.add_argument('--rows', type=int, default=5000, help='Number of rows to load')
     parser.add_argument('--limit', type=int, default=20, help='Number of functions to display')
-    parser.add_argument('--output', help='File path to save the profiling result')
+    parser.add_argument('--output', help='File path to save the stats table')
+    parser.add_argument('--output-file', default='backtest_profile.prof', help='Profiling result .prof file')
     parser.add_argument('--fund', help='Fund profile name to use')  # [Patch v5.3.0]
     parser.add_argument('--train', action='store_true', help='Run training after profiling')  # [Patch v5.3.0]
     parser.add_argument('--train-output', default='models', help='Training output directory')  # [Patch v5.3.0]
+    parser.add_argument('--console_level', default='INFO', help='Console log level')
     args = parser.parse_args()
+    level = getattr(logging, args.console_level.upper(), logging.INFO)
+    for h in logging.getLogger().handlers:
+        if isinstance(h, logging.StreamHandler):
+            h.setLevel(level)
 
-    profiler = cProfile.Profile()
-    profiler.enable()
-    main_profile(
-        args.csv,
-        args.rows,
-        fund_profile_name=args.fund,
-        train=args.train,
-        train_output=args.train_output,
+    profiler = run_profile(
+        lambda: main_profile(
+            args.csv,
+            args.rows,
+            fund_profile_name=args.fund,
+            train=args.train,
+            train_output=args.train_output,
+        ),
+        args.output_file,
     )
-    profiler.disable()
     stats = pstats.Stats(profiler).sort_stats('cumtime')
     if args.output:
         with open(args.output, 'w') as f:

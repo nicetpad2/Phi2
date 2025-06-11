@@ -18,12 +18,19 @@
   - Validate that Codex/AI Studio outputs match the intended diff/patch  
 
 ### Code_Runner_QA
-- **Main Role:** Execution Testing & QA  
+- **Main Role:** Execution Testing & QA
 - **Key Responsibilities:**
   - Run all Python scripts, coordinate `pytest` execution, collect and report test results
   - Set up `sys.path`, environment variables, and mocks for Colab/CI
   - Check build logs for errors or warnings, bundle artifacts for AI Studio or QA review
-  - Validate that no tests fail before any Pull Request is merged  
+  - Validate that no tests fail before any Pull Request is merged
+
+### Pipeline_Manager
+- **Main Role:** Pipeline Orchestration
+- **Key Responsibilities:**
+  - Manage CLI pipeline stages and configuration loading
+  - Detect GPU availability and adjust runtime logging
+  - Raise `PipelineError` when stages fail
 
 ### GoldSurvivor_RnD
 - **Main Role:** Strategy Analysis  
@@ -48,6 +55,7 @@
   - Monitor validation metrics (AUC, F1, recall/precision) over time
   - Audit fallback logic for ML failures; recommend retraining or hyperparameter updates
   - Track model drift and notify when retraining is required  
+  - Provide evaluation utility `evaluate_meta_classifier` in src.evaluation
 
 ### RL_Scalper_AI
 - **Main Role:** Self-Learning Scalper  
@@ -83,7 +91,8 @@
   - Analyze historical folds to tune TP/SL multipliers, `gain_z_thresh`, `rsi` limits, and session logic
   - Leverage Optuna or Bayesian optimization on walk-forward splits
   - Provide “recommended defaults” for SNIPER_CONFIG, RELAX_CONFIG, and ULTRA_RELAX_CONFIG
-  - Publish tuning reports and shapley-value summaries for transparency  
+  - Publish tuning reports and shapley-value summaries for transparency
+  - Manage adaptive risk and SL/TP scaling modules
 
 ---
 
@@ -141,9 +150,16 @@
 - **Key Responsibilities:**
   - Create interactive dashboards (e.g., equity curves, SHAP summary charts, fold performance heatmaps)
   - Use Matplotlib (no seaborn) for static plots; export PNG/HTML for reports
-  - Develop HTML/JavaScript dashboards (e.g., with Plotly or Dash) for executive summaries  
+  - Develop HTML/JavaScript dashboards (e.g., with Plotly or Dash) for executive summaries
+  - New module `src.dashboard` generates Plotly HTML dashboards for WFV results
 
 ---
+
+### Log_Analysis_Helper
+- **Main Role:** Trade Log Analysis
+- **Key Responsibilities:**
+  - Parse raw trade logs and compute hourly win rates
+  - Provide utilities for risk sizing and TSL statistics
 
 ## 📌 Process & Collaboration Guidelines
 
@@ -198,4 +214,6 @@
 
 ---
 - New modular code in ./src (config, data_loader, features, strategy, main).
+- Added pipeline orchestrator `main.py` and simple `threshold_optimization.py` script.
 - `gold ai 3_5.py` now imports `src.main.main` after refactor to modular code.
+- Added new `strategy` package for entry and exit rules.

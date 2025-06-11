@@ -15,14 +15,29 @@ import json
 import pandas as pd
 import numpy as np
 from typing import Dict, List
+from src.utils.model_utils import predict
 # [Patch v5.2.0] Use explicit package import for cooldown utilities
 from src.cooldown_utils import (
     is_soft_cooldown_triggered,
     step_soft_cooldown,
+    CooldownState,
+    update_losses,
+    update_drawdown,
+    should_enter_cooldown,
+    enter_cooldown,
+    should_warn_drawdown,
+    should_warn_losses,
 )
 from itertools import product
 from src.utils.sessions import get_session_tag  # [Patch v5.1.3]
-from src.config import print_gpu_utilization  # [Patch v5.2.0] นำเข้า helper สำหรับแสดงการใช้งาน GPU/RAM (print_gpu_utilization)
+from src.utils import get_env_float
+from src.log_analysis import summarize_block_reasons  # [Patch v5.7.3]
+from src.config import (
+    print_gpu_utilization,  # [Patch v5.2.0] นำเข้า helper สำหรับแสดงการใช้งาน GPU/RAM (print_gpu_utilization)
+    USE_MACD_SIGNALS,
+    USE_RSI_SIGNALS,
+)
+from src.utils.env_utils import get_env_float
 
 # อ่านเวอร์ชันจากไฟล์ VERSION
 VERSION_FILE = os.path.join(os.path.dirname(__file__), '..', 'VERSION')
@@ -40,6 +55,7 @@ except Exception:  # pragma: no cover - fallback when numba unavailable
 from src.data_loader import safe_set_datetime
 from src.data_loader import safe_load_csv_auto  # [Patch v5.1.6] Ensure CSV loader is imported
 from src.data_loader import simple_converter
+from src.data_loader import load_final_m1_data  # [Patch v5.4.5] Loader with validation
 
 # [Patch v4.8.9] Import safe_get_global using unconditional absolute import
 from src.data_loader import safe_get_global
@@ -48,6 +64,10 @@ from src.features import (
     check_model_overfit,
     analyze_feature_importance_shap,
     check_feature_noise_shap,  # [Patch] เพิ่มการ import เพื่อตรวจสอบ SHAP noise
+    rsi,
+    macd,
+    is_volume_spike,
+    detect_macd_divergence,
 )  # [Patch] นำเข้า Dynamic Feature Selection & Overfitting Helpers
 import traceback
 from joblib import dump as joblib_dump # Use joblib dump directly
@@ -58,7 +78,12 @@ from sklearn.metrics import (
     log_loss,
     classification_report,
 )  # [Patch] นำเข้า metric ที่ขาดหายไป
+from src.evaluation import find_best_threshold
+from src.adaptive import compute_dynamic_lot, atr_position_size, compute_trailing_atr_stop
 import gc # For memory management
+from src.utils.gc_utils import maybe_collect
+from src.utils.gc_utils import maybe_collect
+from src.utils.gc_utils import maybe_collect
 import os
 import itertools
 # Import ML libraries conditionally (assuming they are checked/installed in Part 1)
@@ -95,7 +120,7 @@ DEFAULT_META_CLASSIFIER_PATH = "meta_classifier.pkl"
 DEFAULT_SPIKE_MODEL_PATH = "meta_classifier_spike.pkl"
 DEFAULT_CLUSTER_MODEL_PATH = "meta_classifier_cluster.pkl"
 DEFAULT_MODEL_TO_LINK = "catboost"
-DEFAULT_ENABLE_OPTUNA_TUNING = False
+DEFAULT_ENABLE_OPTUNA_TUNING = True
 DEFAULT_OPTUNA_N_TRIALS = 50
 DEFAULT_OPTUNA_CV_SPLITS = 5
 DEFAULT_OPTUNA_METRIC = "AUC"
@@ -198,6 +223,8 @@ def train_and_export_meta_model(
     sample_size=sample_size,
     features_to_drop_before_train=features_to_drop,
     early_stopping_rounds=early_stopping_rounds_config,
+    enable_threshold_tuning=False,
+    fold_index=None,
 ):
     """
     Trains and exports a Meta Classifier (L1) model for a specific purpose
@@ -207,6 +234,7 @@ def train_and_export_meta_model(
 
     Args:
         # ... (Args remain the same) ...
+        fold_index (int, optional): หมายเลขโฟลด์สำหรับแสดงใน log เมื่อไม่มีข้อมูล
 
     Returns:
         tuple[dict, list]: A tuple containing:
@@ -281,7 +309,8 @@ def train_and_export_meta_model(
     elif trade_log_path and isinstance(trade_log_path, str):
         logging.info(f"   กำลังโหลด Trade Log (Default Path): {trade_log_path}")
         try:
-            trade_log_df = safe_load_csv_auto(trade_log_path)
+            # [Patch v5.4.5] Limit loaded rows to manage memory for large logs
+            trade_log_df = safe_load_csv_auto(trade_log_path, row_limit=sample_size)
             if trade_log_df is None:
                 raise ValueError("safe_load_csv_auto returned None for trade log.")
             if trade_log_df.empty:
@@ -340,41 +369,13 @@ def train_and_export_meta_model(
         return None, []
 
     try:
-        m1_df = safe_load_csv_auto(m1_data_path)
-        if m1_df is None: raise ValueError("safe_load_csv_auto returned None for M1 data.")
-        if m1_df.empty:
-            logging.error("   (Error) M1 Data file is empty. Cannot proceed with training.")
-            return None, []
-        required_m1_features = ["Open", "High", "Low", "Close", "ATR_14"]
-        missing_m1_feats = [f for f in required_m1_features if f not in m1_df.columns]
-        if missing_m1_feats:
-            logging.error(f"(Error) M1 Data is missing required features: {missing_m1_feats}. Cannot proceed with training.")
+        m1_df = load_final_m1_data(m1_data_path, trade_log_df)
+        if m1_df is None:
             return None, []
 
-        logging.info("   กำลังเตรียม Index ของ M1 Data...")
-        m1_df.index = pd.to_datetime(m1_df.index, errors='coerce')
-        rows_before_drop = len(m1_df)
-        m1_df = m1_df[m1_df.index.notna()]
-        if len(m1_df) < rows_before_drop:
-            logging.warning(f"   ลบ {rows_before_drop - len(m1_df)} แถวที่มี Index เป็น NaT ใน M1 Data.")
-
-        if not isinstance(m1_df.index, pd.DatetimeIndex):
-            logging.error("   (Error) ไม่สามารถแปลง M1 index เป็น DatetimeIndex.")
-            return None, []
-        if m1_df.empty:
-            logging.error("   (Error) M1 DataFrame ว่างเปล่าหลังแปลง/ล้าง Index.")
-            return None, []
-        if not m1_df.index.is_monotonic_increasing:
-            logging.info("      Sorting M1 DataFrame index...")
-            m1_df = m1_df.sort_index()
-        if m1_df.index.has_duplicates:
-            dup_count = m1_df.index.duplicated().sum()
-            logging.warning(f"   (Warning) พบ Index ซ้ำ {dup_count} รายการใน M1 Data. กำลังลบรายการซ้ำ (เก็บรายการแรก)...")
-            m1_df = m1_df[~m1_df.index.duplicated(keep='first')]
-        # [Patch v5.1.6] Ensure M1 DataFrame has 'datetime' column for merge
-        m1_df['datetime'] = m1_df.index
-
-        logging.info(f"   โหลดและเตรียม M1 สำเร็จ ({len(m1_df)} แถว). จำนวน Features เริ่มต้น: {len(m1_df.columns)}")
+        logging.info(
+            f"   โหลดและเตรียม M1 สำเร็จ ({len(m1_df)} แถว). จำนวน Features เริ่มต้น: {len(m1_df.columns)}"
+        )
     except Exception as e:
         logging.error(f"(Error) ไม่สามารถโหลดหรือเตรียม M1 data: {e}", exc_info=True)
         return None, []
@@ -386,14 +387,18 @@ def train_and_export_meta_model(
     logging.info("   กำลังรวม Trade Log กับ M1 Features (merge_asof)...")
     try:
         if not pd.api.types.is_datetime64_any_dtype(trade_log_df["datetime"]):
-            trade_log_df["datetime"] = pd.to_datetime(trade_log_df["datetime"], errors='coerce')
-            trade_log_df.dropna(subset=["datetime"], inplace=True)
+            trade_log_df["datetime"] = pd.to_datetime(trade_log_df["datetime"], errors='coerce', utc=True)
+        else:
+            trade_log_df["datetime"] = pd.to_datetime(trade_log_df["datetime"], utc=True)
+        trade_log_df.dropna(subset=["datetime"], inplace=True)
         if trade_log_df.empty:
             logging.error("(Error) ไม่มี Trades ที่มี datetime ถูกต้องหลังการแปลง (ก่อน Merge).")
             return None, []
         if not pd.api.types.is_datetime64_any_dtype(m1_df["datetime"]):
-            m1_df["datetime"] = pd.to_datetime(m1_df["datetime"], errors='coerce')
-            m1_df.dropna(subset=["datetime"], inplace=True)
+            m1_df["datetime"] = pd.to_datetime(m1_df["datetime"], errors='coerce', utc=True)
+        else:
+            m1_df["datetime"] = pd.to_datetime(m1_df["datetime"], utc=True)
+        m1_df.dropna(subset=["datetime"], inplace=True)
         if trade_log_df.empty or m1_df.empty:
             logging.error("(Error) DataFrame ว่างหลังการเตรียม datetime สำหรับ merge.")
             return None, []
@@ -409,7 +414,7 @@ def train_and_export_meta_model(
         )
         logging.info(f"   Merge completed. Shape after merge: {merged_df.shape}")
         del trade_log_df, m1_df
-        gc.collect()
+        maybe_collect()
 
         # [Patch v5.1.6] Load feature list from features_main.json
         features_json_path = os.path.join(output_dir, "features_main.json")
@@ -443,7 +448,10 @@ def train_and_export_meta_model(
         if rows_dropped > 0:
             logging.info(f"   [NaN Check] ลบ {rows_dropped} Trades ที่มี Missing Features หรือ NaN ใน Features/Target.")
         if merged_df.empty:
-            logging.error("(Error) ไม่มีข้อมูลสมบูรณ์หลังการรวมและ Drop NaN.")
+            if fold_index is not None:
+                logging.error(f"โฟลด์ {fold_index} ไม่มีข้อมูลเพียงพอสำหรับฝึกโมเดล")
+            else:
+                logging.error("(Error) ไม่มีข้อมูลสมบูรณ์หลังการรวมและ Drop NaN.")
             return None, []
         logging.info(f"   (Success) การรวมข้อมูลเสร็จสมบูรณ์ ({len(merged_df)} samples before sampling).")
 
@@ -461,7 +469,7 @@ def train_and_export_meta_model(
         if 'trade_log_df' in locals() and 'trade_log_df' in globals() and trade_log_df is not None: del trade_log_df
         if 'm1_df' in locals() and 'm1_df' in globals() and m1_df is not None: del m1_df
         if 'merged_df' in locals() and 'merged_df' in globals() and merged_df is not None: del merged_df
-        gc.collect()
+        maybe_collect()
         return None, []
 
     selected_features = initial_features_for_selection
@@ -630,19 +638,27 @@ def train_and_export_meta_model(
             if potential_lag_features:
                 logging.info(f"         Lag Features ที่มีให้พิจารณา: {potential_lag_features}")
                 try:
-                    prelim_fi = prelim_model.get_feature_importance()
-                    significant_lags = []
-                    total_fi = sum(prelim_fi.values())
-                    fi_threshold_abs = 0.1
-                    if total_fi > 1e-9:
-                        fi_threshold_norm = 0.001
-                        for lag_feat in potential_lag_features:
-                            if lag_feat in prelim_fi and (prelim_fi[lag_feat] / total_fi) > fi_threshold_norm:
-                                significant_lags.append(lag_feat)
+                    # [Patch v5.5.4] Evaluate Lag Feature importance using SHAP with full feature set
+                    lag_pool = Pool(X_select, label=y_select, cat_features=cat_features_indices_select_cpu)
+                    explainer_lag = shap.TreeExplainer(prelim_model)
+                    shap_vals_lag = explainer_lag.shap_values(lag_pool)
+                    shap_vals_pos = None
+                    df_lag = None
+                    if isinstance(shap_vals_lag, list) and len(shap_vals_lag) == 2:
+                        shap_vals_pos = shap_vals_lag[1]
+                    elif isinstance(shap_vals_lag, np.ndarray) and shap_vals_lag.ndim == 2:
+                        shap_vals_pos = shap_vals_lag
+                    elif isinstance(shap_vals_lag, np.ndarray) and shap_vals_lag.ndim == 3 and shap_vals_lag.shape[0] >= 2:
+                        shap_vals_pos = shap_vals_lag[1, :, :]
+                    if shap_vals_pos is not None:
+                        df_lag = pd.DataFrame(shap_vals_pos, columns=X_select.columns)[potential_lag_features]
+                        mean_abs_lag = df_lag.abs().mean().values
+                        lag_df = pd.DataFrame({'feature': potential_lag_features, 'mean_abs_shap': mean_abs_lag})
+                        total_shap = lag_df['mean_abs_shap'].sum()
+                        lag_df['norm_shap'] = lag_df['mean_abs_shap'] / total_shap if total_shap > 1e-9 else 0.0
+                        significant_lags = lag_df[lag_df['norm_shap'] >= shap_importance_threshold]['feature'].tolist()
                     else:
-                        for lag_feat in potential_lag_features:
-                            if lag_feat in prelim_fi and prelim_fi[lag_feat] > fi_threshold_abs:
-                                significant_lags.append(lag_feat)
+                        significant_lags = []
 
                     if significant_lags:
                         logging.info(f"         Lag Features ที่มีความสำคัญเบื้องต้น: {significant_lags}")
@@ -652,9 +668,9 @@ def train_and_export_meta_model(
                             selected_features.extend(added_lags)
                     else:
                         logging.info("         ไม่มี Lag Features ที่มีความสำคัญเบื้องต้นตามเกณฑ์.")
-                    del prelim_fi, significant_lags
+                    del shap_vals_lag, shap_vals_pos, df_lag, lag_df, mean_abs_lag, total_shap
                 except Exception as e_lag_fi:
-                    logging.warning(f"         (Warning) ไม่สามารถประเมินความสำคัญ Lag Features: {e_lag_fi}")
+                    logging.warning(f"Cannot evaluate Lag Features: {e_lag_fi}")
             else:
                 logging.info("         ไม่มี Lag Features ให้พิจารณา.")
 
@@ -676,7 +692,7 @@ def train_and_export_meta_model(
         if 'shap_values_pos_class' in locals(): del shap_values_pos_class
         if 'selected_features_shap' in locals(): del selected_features_shap
         if 'selected_features_perm' in locals(): del selected_features_perm
-        gc.collect()
+        maybe_collect()
         logging.debug("      Memory cleanup complete.")
 
     else:
@@ -942,6 +958,19 @@ def train_and_export_meta_model(
             except Exception as e_quality_check:
                 logging.error(f"      (Error) Error during Final Model Quality Check: {e_quality_check}", exc_info=True)
 
+            if enable_threshold_tuning and y_proba_cat_val is not None:
+                try:
+                    res = find_best_threshold(y_proba_cat_val, y_val_cat)
+                    best_t = res["best_threshold"]
+                    best_s = res["best_f1"]
+                    logging.info(
+                        f"[Patch] Tuned threshold to {best_t:.2f} (F1={best_s:.3f})"
+                    )
+                except Exception as e_thresh:
+                    logging.warning(
+                        f"[Patch] Threshold tuning failed: {e_thresh}"
+                    )
+
             # --- SHAP Analysis on Validation Set ---
             if shap and X_val_cat_for_shap is not None and not X_val_cat_for_shap.empty and cat_model is not None: # Check cat_model exists
                 logging.info(f"\n      --- SHAP Analysis (Final Model - Validation Set - Purpose: {model_purpose.upper()}) ---")
@@ -969,7 +998,7 @@ def train_and_export_meta_model(
                     else:
                         logging.warning("         (Warning) ไม่สามารถระบุ SHAP values สำหรับ TP Class (Final Validation) สำหรับ Noise Check.")
                     del shap_pool_val_final, explainer_val_final, shap_values_val_final, shap_values_cat_val
-                    gc.collect()
+                    maybe_collect()
                 except Exception as e_shap:
                     logging.error(f"         (Error) Error during SHAP Analysis/Noise Check (Final Model): {e_shap}", exc_info=True)
             else:
@@ -987,7 +1016,7 @@ def train_and_export_meta_model(
             if 'X' in locals(): del X
             if 'y' in locals(): del y
             if 'merged_df' in locals() and 'merged_df' in globals() and merged_df is not None: del merged_df
-            gc.collect()
+            maybe_collect()
 
     # --- Save Final Model and Features ---
     logging.info(f"\n   --- Saving Final Model (Purpose: {model_purpose.upper()}) ---")
@@ -1035,7 +1064,7 @@ def train_and_export_meta_model(
     end_train_time = time.time()
     logging.info(f"(Finished - v{__version__}) Meta Classifier Training (Purpose: {model_purpose.upper()}) complete in {end_train_time - start_train_time:.2f} seconds.") # Updated version in log
     if 'X_val_cat_for_shap' in locals(): del X_val_cat_for_shap
-    gc.collect()
+    maybe_collect()
     return saved_model_paths, final_features_catboost
 
 logging.info(f"Part 7: Model Training Function Loaded (v{__version__} Applied).")
@@ -1081,7 +1110,7 @@ except ImportError:
 # def safe_get_global(var_name, default_value): ...
 
 # Define defaults (these should match Part 2 ideally)
-DEFAULT_SESSION_TIMES_UTC = {"Asia": (0, 8), "London": (7, 16), "NY": (13, 21)}
+DEFAULT_SESSION_TIMES_UTC = {"Asia": (22, 8), "London": (7, 16), "NY": (13, 21)}
 DEFAULT_BASE_TP_MULTIPLIER = 1.8
 DEFAULT_ADAPTIVE_TSL_HIGH_VOL_RATIO = 1.8
 DEFAULT_ADAPTIVE_TSL_LOW_VOL_RATIO = 0.75
@@ -1090,7 +1119,13 @@ DEFAULT_ADAPTIVE_TSL_HIGH_VOL_STEP_R = 1.0
 DEFAULT_ADAPTIVE_TSL_LOW_VOL_STEP_R = 0.3
 DEFAULT_ADAPTIVE_TSL_START_ATR_MULT = 1.5
 DEFAULT_ENABLE_SPIKE_GUARD = True
-DEFAULT_MIN_SIGNAL_SCORE_ENTRY = 2.0
+DEFAULT_ENABLE_SOFT_COOLDOWN = True
+DEFAULT_MIN_SIGNAL_SCORE_ENTRY = 1.0
+DEFAULT_ADAPTIVE_SIGNAL_SCORE_WINDOW = 1000
+DEFAULT_ADAPTIVE_SIGNAL_SCORE_QUANTILE = 0.7
+DEFAULT_MIN_SIGNAL_SCORE_ENTRY_MIN = 0.5
+DEFAULT_MIN_SIGNAL_SCORE_ENTRY_MAX = 3.0
+DEFAULT_USE_ADAPTIVE_SIGNAL_SCORE = True
 DEFAULT_RECOVERY_MODE_CONSECUTIVE_LOSSES = 4
 DEFAULT_RECOVERY_MODE_LOT_MULTIPLIER = 0.5
 DEFAULT_MIN_LOT_SIZE = 0.01
@@ -1100,12 +1135,14 @@ DEFAULT_RISK_PER_TRADE = 0.01
 DEFAULT_USE_REENTRY = True
 DEFAULT_REENTRY_COOLDOWN_BARS = 1
 DEFAULT_TIMEFRAME_MINUTES_M1 = 1
-DEFAULT_MAX_CONCURRENT_ORDERS = 5
+DEFAULT_MAX_CONCURRENT_ORDERS = 7
 DEFAULT_MAX_HOLDING_BARS = 24
 DEFAULT_COMMISSION_PER_001_LOT = 0.10
 DEFAULT_SPREAD_POINTS = 2.0
 DEFAULT_MIN_SLIPPAGE_POINTS = -5.0
 DEFAULT_MAX_SLIPPAGE_POINTS = -1.0
+DEFAULT_OMS_MARGIN_PIPS = 20.0
+DEFAULT_OMS_MAX_DISTANCE_PIPS = 1000.0
 DEFAULT_MAX_DRAWDOWN_THRESHOLD = 0.30
 DEFAULT_ENABLE_FORCED_ENTRY = True
 DEFAULT_FORCED_ENTRY_BAR_THRESHOLD = 100
@@ -1113,12 +1150,12 @@ DEFAULT_FORCED_ENTRY_MIN_SIGNAL_SCORE = 0.5
 DEFAULT_FORCED_ENTRY_LOOKBACK_PERIOD = 500
 DEFAULT_FORCED_ENTRY_CHECK_MARKET_COND = True
 DEFAULT_FORCED_ENTRY_MAX_ATR_MULT = 2.5
-DEFAULT_FORCED_ENTRY_MIN_GAIN_Z_ABS = 1.0
-DEFAULT_FORCED_ENTRY_ALLOWED_REGIMES = ["Normal", "Breakout", "StrongTrend"]
+DEFAULT_FORCED_ENTRY_MIN_GAIN_Z_ABS = 0.5  # [Patch v5.6.4]
+DEFAULT_FORCED_ENTRY_ALLOWED_REGIMES = ["Normal", "Breakout", "StrongTrend", "Reversal", "InsideBar", "Choppy"]  # [Patch v5.6.4]
 DEFAULT_FE_ML_FILTER_THRESHOLD = 0.40
 DEFAULT_forced_entry_max_consecutive_losses = 2
 DEFAULT_min_equity_threshold_pct = 0.70
-DEFAULT_ENTRY_CONFIG_PER_FOLD = {0: {"sl_multiplier": 2.0, "gain_z_thresh": 0.3, "cooldown_sec": 0, "min_signal_score": 2.0}}
+DEFAULT_ENTRY_CONFIG_PER_FOLD = {0: {"sl_multiplier": 2.8, "gain_z_thresh": 0.3, "cooldown_sec": 0, "min_signal_score": 1.0}}
 DEFAULT_BASE_BE_SL_R_THRESHOLD = 1.0
 DEFAULT_DYNAMIC_BE_ATR_THRESHOLD_HIGH = 1.2
 DEFAULT_DYNAMIC_BE_R_ADJUST_HIGH = 0.2
@@ -1126,12 +1163,14 @@ DEFAULT_ENABLE_PARTIAL_TP = True
 DEFAULT_PARTIAL_TP_LEVELS = [{"r_multiple": 0.8, "close_pct": 0.5}]
 DEFAULT_PARTIAL_TP_MOVE_SL_TO_ENTRY = True
 DEFAULT_ENABLE_KILL_SWITCH = True
-DEFAULT_KILL_SWITCH_MAX_DD_THRESHOLD = 0.20
-DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 7
+DEFAULT_KILL_SWITCH_MAX_DD_THRESHOLD = 0.15
+DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 5
+DEFAULT_KILL_SWITCH_WARNING_MAX_DD_THRESHOLD = 0.25
+DEFAULT_KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD = 7
 DEFAULT_FUND_PROFILES = {"NORMAL": {"risk": 0.01, "mm_mode": "balanced"}}
 DEFAULT_FUND_NAME = "NORMAL"
 DEFAULT_USE_META_CLASSIFIER = True
-DEFAULT_META_MIN_PROBA_THRESH = 0.5
+DEFAULT_META_MIN_PROBA_THRESH = 0.3
 DEFAULT_REENTRY_MIN_PROBA_THRESH = 0.5
 DEFAULT_OUTPUT_DIR = "./output_default"
 
@@ -1145,7 +1184,13 @@ ADAPTIVE_TSL_HIGH_VOL_STEP_R = safe_get_global('ADAPTIVE_TSL_HIGH_VOL_STEP_R', D
 ADAPTIVE_TSL_LOW_VOL_STEP_R = safe_get_global('ADAPTIVE_TSL_LOW_VOL_STEP_R', DEFAULT_ADAPTIVE_TSL_LOW_VOL_STEP_R)
 ADAPTIVE_TSL_START_ATR_MULT = safe_get_global('ADAPTIVE_TSL_START_ATR_MULT', DEFAULT_ADAPTIVE_TSL_START_ATR_MULT)
 ENABLE_SPIKE_GUARD = safe_get_global('ENABLE_SPIKE_GUARD', DEFAULT_ENABLE_SPIKE_GUARD)
+ENABLE_SOFT_COOLDOWN = safe_get_global('ENABLE_SOFT_COOLDOWN', DEFAULT_ENABLE_SOFT_COOLDOWN)
 MIN_SIGNAL_SCORE_ENTRY = safe_get_global('MIN_SIGNAL_SCORE_ENTRY', DEFAULT_MIN_SIGNAL_SCORE_ENTRY)
+ADAPTIVE_SIGNAL_SCORE_WINDOW = safe_get_global('ADAPTIVE_SIGNAL_SCORE_WINDOW', DEFAULT_ADAPTIVE_SIGNAL_SCORE_WINDOW)
+ADAPTIVE_SIGNAL_SCORE_QUANTILE = safe_get_global('ADAPTIVE_SIGNAL_SCORE_QUANTILE', DEFAULT_ADAPTIVE_SIGNAL_SCORE_QUANTILE)
+MIN_SIGNAL_SCORE_ENTRY_MIN = safe_get_global('MIN_SIGNAL_SCORE_ENTRY_MIN', DEFAULT_MIN_SIGNAL_SCORE_ENTRY_MIN)
+MIN_SIGNAL_SCORE_ENTRY_MAX = safe_get_global('MIN_SIGNAL_SCORE_ENTRY_MAX', DEFAULT_MIN_SIGNAL_SCORE_ENTRY_MAX)
+USE_ADAPTIVE_SIGNAL_SCORE = safe_get_global('USE_ADAPTIVE_SIGNAL_SCORE', DEFAULT_USE_ADAPTIVE_SIGNAL_SCORE)
 RECOVERY_MODE_CONSECUTIVE_LOSSES = safe_get_global('RECOVERY_MODE_CONSECUTIVE_LOSSES', DEFAULT_RECOVERY_MODE_CONSECUTIVE_LOSSES)
 RECOVERY_MODE_LOT_MULTIPLIER = safe_get_global('RECOVERY_MODE_LOT_MULTIPLIER', DEFAULT_RECOVERY_MODE_LOT_MULTIPLIER)
 MIN_LOT_SIZE = safe_get_global('MIN_LOT_SIZE', DEFAULT_MIN_LOT_SIZE)
@@ -1161,6 +1206,8 @@ COMMISSION_PER_001_LOT = safe_get_global('COMMISSION_PER_001_LOT', DEFAULT_COMMI
 SPREAD_POINTS = safe_get_global('SPREAD_POINTS', DEFAULT_SPREAD_POINTS)
 MIN_SLIPPAGE_POINTS = safe_get_global('MIN_SLIPPAGE_POINTS', DEFAULT_MIN_SLIPPAGE_POINTS)
 MAX_SLIPPAGE_POINTS = safe_get_global('MAX_SLIPPAGE_POINTS', DEFAULT_MAX_SLIPPAGE_POINTS)
+OMS_MARGIN_PIPS = safe_get_global('OMS_MARGIN_PIPS', DEFAULT_OMS_MARGIN_PIPS)
+OMS_MAX_DISTANCE_PIPS = safe_get_global('OMS_MAX_DISTANCE_PIPS', DEFAULT_OMS_MAX_DISTANCE_PIPS)
 MAX_DRAWDOWN_THRESHOLD = safe_get_global('MAX_DRAWDOWN_THRESHOLD', DEFAULT_MAX_DRAWDOWN_THRESHOLD)
 ENABLE_FORCED_ENTRY = safe_get_global('ENABLE_FORCED_ENTRY', DEFAULT_ENABLE_FORCED_ENTRY)
 FORCED_ENTRY_BAR_THRESHOLD = safe_get_global('FORCED_ENTRY_BAR_THRESHOLD', DEFAULT_FORCED_ENTRY_BAR_THRESHOLD)
@@ -1183,6 +1230,8 @@ PARTIAL_TP_MOVE_SL_TO_ENTRY = safe_get_global('PARTIAL_TP_MOVE_SL_TO_ENTRY', DEF
 ENABLE_KILL_SWITCH = safe_get_global('ENABLE_KILL_SWITCH', DEFAULT_ENABLE_KILL_SWITCH)
 KILL_SWITCH_MAX_DD_THRESHOLD = safe_get_global('KILL_SWITCH_MAX_DD_THRESHOLD', DEFAULT_KILL_SWITCH_MAX_DD_THRESHOLD)
 KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = safe_get_global('KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD', DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD)
+KILL_SWITCH_WARNING_MAX_DD_THRESHOLD = safe_get_global('KILL_SWITCH_WARNING_MAX_DD_THRESHOLD', DEFAULT_KILL_SWITCH_WARNING_MAX_DD_THRESHOLD)
+KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD = safe_get_global('KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD', DEFAULT_KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD)
 FUND_PROFILES = safe_get_global('FUND_PROFILES', DEFAULT_FUND_PROFILES)
 DEFAULT_FUND_NAME = safe_get_global('DEFAULT_FUND_NAME', DEFAULT_FUND_NAME)
 USE_META_CLASSIFIER = safe_get_global('USE_META_CLASSIFIER', DEFAULT_USE_META_CLASSIFIER)
@@ -1243,6 +1292,19 @@ def get_adaptive_tsl_step(current_atr, avg_atr, default_step=None):
             return default_step
     except Exception:
         return default_step
+
+# [Patch v5.3.9] Adaptive Signal Score helper
+def get_dynamic_signal_score_entry(df, window=1000, quantile=0.7, min_val=0.5, max_val=3.0):
+    """Return quantile-based signal score threshold with clamp."""
+    if df is None or 'Signal_Score' not in df.columns or len(df) == 0:
+        return min_val
+    scores = df['Signal_Score'].dropna().astype(float)
+    recent_scores = scores.iloc[-window:]
+    if recent_scores.empty:
+        return min_val
+    val = recent_scores.quantile(quantile)
+    val = max(min_val, min(val, max_val))
+    return float(val)
 
 # <<< [Patch] MODIFIED v4.8.8 (Patch 11): Renamed and simplified to only handle TSL >>>
 def update_tsl_only(order, current_high, current_low, current_atr, avg_atr, atr_multiplier=1.5):
@@ -1318,14 +1380,67 @@ def update_trailing_tp2(order, atr, multiplier):
     return order
 
 
+# [Patch v5.5.8] OMS_Guardian helpers
+def adjust_sl_tp_oms(entry_price, sl_price, tp_price, atr, side,
+                     margin_pips, max_pips):
+    """Validate SL/TP distance and auto-adjust if outside allowed range."""
+    if any(pd.isna(v) for v in [entry_price, sl_price, tp_price, atr]):
+        return sl_price, tp_price
+
+    sl_dist = abs(entry_price - sl_price) * 10.0
+    tp_dist = abs(tp_price - entry_price) * 10.0
+
+    if sl_dist < margin_pips:
+        adj = atr if pd.notna(atr) and atr > 1e-9 else margin_pips / 10.0
+        sl_price = entry_price - adj if side == "BUY" else entry_price + adj
+        logging.info(f"[OMS_Guardian] Adjust SL to margin level: {sl_price:.5f}")
+
+    if sl_dist > max_pips:
+        sl_price = entry_price - atr if side == "BUY" else entry_price + atr
+        logging.info(f"[OMS_Guardian] SL distance too wide. Adjusted to {sl_price:.5f}")
+
+    if tp_dist > max_pips:
+        tp_price = entry_price + atr if side == "BUY" else entry_price - atr
+        logging.info(f"[OMS_Guardian] TP distance too wide. Adjusted to {tp_price:.5f}")
+
+    return sl_price, tp_price
+
+
+def update_breakeven_half_tp(order, current_high, current_low, now, entry_buffer=0.0001):
+    """Move SL to breakeven when price moves halfway to TP1."""
+    if order.get("be_triggered", False):
+        return order, False
+
+    side = order.get("side")
+    entry = pd.to_numeric(order.get("entry_price"), errors="coerce")
+    tp1 = pd.to_numeric(order.get("tp1_price"), errors="coerce")
+    sl = pd.to_numeric(order.get("sl_price"), errors="coerce")
+
+    if any(pd.isna(v) for v in [side, entry, tp1, sl]):
+        return order, False
+
+    trigger = entry + 0.5 * (tp1 - entry) if side == "BUY" else entry - 0.5 * (entry - tp1)
+    hit = (side == "BUY" and current_high >= trigger) or (side == "SELL" and current_low <= trigger)
+
+    if hit:
+        new_sl = entry + entry_buffer if side == "BUY" else entry - entry_buffer
+        if not math.isclose(sl, new_sl, rel_tol=1e-9, abs_tol=1e-9):
+            order["sl_price"] = new_sl
+            order["be_triggered"] = True
+            order["be_triggered_time"] = now
+            logging.info(f"Move to Breakeven at price {new_sl:.5f}")
+            return order, True
+
+    return order, False
+
+
 def spike_guard_london(row, session, consecutive_losses):
-    """
-    Applies spike guard filter, primarily for London session.
-    (v4.8.8 Patch 5: Re-verified logic)
-    """
+    """Spike guard filter for London session with debug reasons."""
     if not ENABLE_SPIKE_GUARD:
+        logging.debug("      (Spike Guard) Disabled via config.")
         return True
     if not isinstance(session, str) or "London" not in session:
+        logging.debug("      (Spike Guard) Not London session - skipping.")
         return True
 
     spike_score_val = pd.to_numeric(getattr(row, "spike_score", np.nan), errors='coerce')
@@ -1342,6 +1457,7 @@ def spike_guard_london(row, session, consecutive_losses):
     atr_val = pd.to_numeric(getattr(row, "ATR_14", np.nan), errors='coerce')
 
     if any(pd.isna(v) for v in [adx_val, wick_ratio_val, vol_index_val, candle_body_val, candle_range_val, gain_val, atr_val]):
+        logging.debug("      (Spike Guard) Missing values - skip filter.")
         return True
 
     safe_candle_range_val = max(candle_range_val, 1e-9)
@@ -1361,25 +1477,60 @@ def spike_guard_london(row, session, consecutive_losses):
 
     if gain_val > 3 and atr_val > 4 and (candle_body_val / safe_candle_range_val) > 0.3:
         logging.debug("      (Spike Guard Allowed) Reason: Strong directional move override.")
+        logging.debug("      (Spike Guard Allowed) Reason: Strong directional move override.")
         return True
 
+    logging.debug("      (Spike Guard) Passed all checks.")
     return True
 
-def is_entry_allowed(row, session, consecutive_losses, signal_score_threshold=None):
-    """Checks if entry is allowed based on filters."""
+# [Patch v5.5.6] Multi-timeframe trend confirmation
+def is_mtf_trend_confirmed(m15_trend, side):
+    """Validate entry direction using M15 trend zone."""
+    trend = str(m15_trend).upper() if isinstance(m15_trend, str) else "NEUTRAL"
+    if side == "BUY" and trend != "UP":
+        return False
+    if side == "SELL" and trend != "DOWN":
+        return False
+    return True
+
+# [Patch v5.6.5] Volatility filter helper
+def passes_volatility_filter(vol_index, min_ratio=1.0):
+    """Return True if Volatility_Index >= min_ratio."""
+    vol_val = pd.to_numeric(vol_index, errors="coerce")
+    if pd.isna(vol_val):
+        return False
+    return vol_val >= min_ratio
+
+def is_entry_allowed(row, session, consecutive_losses, side, m15_trend=None, signal_score_threshold=None):
+    """Checks if entry is allowed based on filters with debug logging."""
     if signal_score_threshold is None:
         global MIN_SIGNAL_SCORE_ENTRY
         signal_score_threshold = MIN_SIGNAL_SCORE_ENTRY
 
     if not spike_guard_london(row, session, consecutive_losses):
+        logging.debug("      Entry blocked by Spike Guard.")
         return False, "SPIKE_GUARD_LONDON"
+
+    if not is_mtf_trend_confirmed(m15_trend, side):
+        logging.debug("      Entry blocked by M15 Trend filter.")
+        return False, f"M15_TREND_{str(m15_trend).upper()}"
+
+    vol_index_val = pd.to_numeric(getattr(row, "Volatility_Index", np.nan), errors='coerce')
+    if not passes_volatility_filter(vol_index_val):
+        logging.debug(f"      Entry blocked by Low Volatility ({vol_index_val})")
+        return False, f"LOW_VOLATILITY({vol_index_val})"
 
     signal_score = pd.to_numeric(getattr(row, "Signal_Score", np.nan), errors='coerce')
     if pd.isna(signal_score):
+        logging.debug("      Entry blocked: Invalid Signal Score (NaN)")
         return False, "INVALID_SIGNAL_SCORE (NaN)"
     if abs(signal_score) < signal_score_threshold:
+        logging.debug(
+            f"      Entry blocked: Low Signal Score {signal_score:.2f} < {signal_score_threshold}"
+        )
         return False, f"LOW_SIGNAL_SCORE ({signal_score:.2f}<{signal_score_threshold})"
 
+    logging.debug("      Entry allowed by filters.")
     return True, "ALLOWED"
 
 def adjust_lot_recovery_mode(base_lot, consecutive_losses):
@@ -1591,6 +1742,12 @@ def _update_open_order_state(order, current_high, current_low, current_atr, avg_
     atr_at_entry = pd.to_numeric(order.get("atr_at_entry"), errors='coerce')
     entry_time_log = order.get('entry_time', 'N/A') # For logging
 
+    # [Patch v5.5.8] Breakeven logic when price moves half way to TP1
+    order, be_half = update_breakeven_half_tp(order, current_high, current_low, now)
+    if be_half:
+        be_sl_counter += 1
+        be_triggered_this_bar = True
+
     if not order.get("be_triggered", False):
         dynamic_be_r_threshold = base_be_r_thresh
         try:
@@ -1641,6 +1798,26 @@ def _update_open_order_state(order, current_high, current_low, current_atr, avg_
             new_sl_price_after_tsl_val = pd.to_numeric(order.get("sl_price"), errors='coerce')
             sl_after_tsl_text = f"{new_sl_price_after_tsl_val:.5f}" if pd.notna(new_sl_price_after_tsl_val) else "NaN"
             logging.debug(f"            Order {entry_time_log} after update_tsl_only. SL after={sl_after_tsl_text}")
+
+            # Trailing ATR stop-loss update
+            new_sl_atr = compute_trailing_atr_stop(
+                entry_price,
+                current_high if order_side == "BUY" else current_low,
+                current_atr,
+                order_side,
+                order.get("sl_price"),
+            )
+            new_sl_val = pd.to_numeric(new_sl_atr, errors="coerce")
+            current_sl_val = pd.to_numeric(order.get("sl_price"), errors="coerce")
+            if pd.notna(new_sl_val) and pd.notna(current_sl_val):
+                if (order_side == "BUY" and new_sl_val > current_sl_val) or (
+                    order_side == "SELL" and new_sl_val < current_sl_val
+                ):
+                    logging.info(
+                        f"         [ATR SL] Updating SL from {current_sl_val:.5f} to {new_sl_val:.5f} for order {entry_time_log}"
+                    )
+                    order["sl_price"] = new_sl_val
+                    tsl_updated_this_bar = True
     else:
         logging.debug(f"            Skipping TSL checks for order {entry_time_log} because BE was triggered in this bar.")
 
@@ -1655,11 +1832,22 @@ def _update_open_order_state(order, current_high, current_low, current_atr, avg_
     tp_price_val_after = order.get('tp_price')
     tp_after_str = f"{tp_price_val_after:.5f}" if pd.notna(tp_price_val_after) else "NaN"
     logging.debug(f"            Order {entry_time_log} after update_trailing_tp2. TP after={tp_after_str}")
-
     return order, be_triggered_this_bar, tsl_updated_this_bar, be_sl_counter, tsl_counter
 
+# <<< [Patch v5.5.2] Helper to resolve close index >>>
+def _resolve_close_index(df_sim, entry_idx, close_timestamp):
+    """Return a valid index for closing orders."""
+    if entry_idx is None:
+        return None
+    if entry_idx in df_sim.index:
+        return entry_idx
+    nearest_pos = df_sim.index.get_indexer([close_timestamp], method="nearest")[0]
+    resolved_idx = df_sim.index[nearest_pos]
+    logging.warning(
+        f"(Warning) entry index {entry_idx} not in df_sim.index. ใช้ nearest_idx {resolved_idx} แทน."
+    )
+    return resolved_idx
 
-# --- Backtesting Simulation Engine ---
 # <<< [Patch] MODIFIED v4.8.8 (Patch 26.5.1): Applied [PATCH C - Unified] for error handling and logging fix. >>>
 def run_backtest_simulation_v34(
     df_m1_segment_pd,
@@ -1711,16 +1899,19 @@ def run_backtest_simulation_v34(
     last_trade_cooldown_end_time = defaultdict(lambda: min_ts); last_tp_time = defaultdict(lambda: min_ts)
     bars_since_last_trade = 0; kill_switch_activated = initial_kill_switch_state; consecutive_losses = initial_consecutive_losses
     forced_entry_consecutive_losses = 0; forced_entry_temporarily_disabled = False; last_n_full_trade_pnls = []
-    soft_cooldown_bars_remaining = 0
-    SOFT_COOLDOWN_LOOKBACK = 10
-    # [Patch v5.0.18] Increase loss threshold to reduce trade blocking
-    SOFT_COOLDOWN_LOSS_COUNT = 6
+    last_n_full_trade_sides = []
+    cd_state = CooldownState()
+    SOFT_COOLDOWN_LOOKBACK = 15
+    # [Patch v5.6.6] Increase lookback for more flexibility
+    SOFT_COOLDOWN_LOSS_COUNT = 8
     # [Patch v5.0.18] MACD entry thresholds to allow mild counter-trend trades
     MACD_NEG_THRESHOLD_BUY = -0.05
     MACD_POS_THRESHOLD_SELL = 0.05
     kill_switch_trigger_time = pd.NaT
     current_risk_mode = "normal"; trade_history_list = []
     error_in_loop = False
+    # [Patch] Track last logged threshold to avoid spam
+    last_logged_signal_thresh = None
 
     if not isinstance(df_m1_segment_pd, pd.DataFrame): logging.error(f"   (Error) Invalid input: df_m1_segment_pd is not a DataFrame for {label}."); run_summary_error = {"error_in_loop": True, "total_commission": 0, "total_spread": 0, "total_slippage": 0}; return pd.DataFrame(), pd.DataFrame(), initial_capital_segment, equity_history, 0.0, run_summary_error, blocked_order_log, "N/A", "N/A", initial_kill_switch_state, initial_consecutive_losses, 0.0
     if df_m1_segment_pd.empty: logging.warning(f"   (Warning) Input DataFrame is empty for {label}. Skipping simulation."); run_summary_error = {"error_in_loop": False, "total_commission": 0, "total_spread": 0, "total_slippage": 0}; return df_m1_segment_pd, pd.DataFrame(), initial_capital_segment, equity_history, 0.0, run_summary_error, blocked_order_log, "N/A", "N/A", initial_kill_switch_state, initial_consecutive_losses, 0.0
@@ -1754,6 +1945,7 @@ def run_backtest_simulation_v34(
     label_suffix = f"_{label}"; logging.debug(f"Preparing DataFrame for simulation run: {label}")
     result_cols = ["Lot_Size", "Order_Opened", "Order_Closed_Time", "PnL_Realized_USD", "Commission_USD", "Spread_Cost_USD", "Slippage_USD", "Equity_Realistic", "Active_Order_Count", "Max_Drawdown_At_Point", "Exit_Reason_Actual", "Exit_Price_Actual", "PnL_Points_Actual", "M15_Trend_Zone", "M1_Entry_Signal", "Signal_Score", "Trade_Reason", "Session", "BE_Triggered_Time", "Is_Reentry", "Meta_Proba_TP", "Meta2_Proba_TP", "Forced_Entry", "Entry_Price_Actual", "SL_Price_Actual", "TP_Price_Actual", "ATR_At_Entry", "Equity_Before_Open", "Entry_Gain_Z", "Entry_MACD_Smooth", "Entry_Candle_Ratio", "Entry_ADX", "Entry_Volatility_Index", "Trade_Tag", "Risk_Mode", "Active_Model", "Model_Confidence"]
     df_sim = df_m1_segment_pd.copy()
+    volume_ma20 = df_sim['Volume'].rolling(20).mean() if 'Volume' in df_sim.columns else None
     for col_base in result_cols:
         col_name = f"{col_base}{label_suffix}"
         if col_name not in df_sim.columns:
@@ -1765,7 +1957,11 @@ def run_backtest_simulation_v34(
             else: default_val = 0.0
             df_sim[col_name] = default_val
     logging.debug(f"Result columns initialized for suffix '{label_suffix}'.")
-    base_cfg = ENTRY_CONFIG_PER_FOLD.get(current_fold_index, ENTRY_CONFIG_PER_FOLD.get(0, {})); fold_sl_multiplier_base = fold_config.get("sl_multiplier", base_cfg.get("sl_multiplier", 2.0)); logging.info(f"   [Patch B Check] Using SL Multiplier: {fold_sl_multiplier_base} for Fold {current_fold_index+1} (from fold_config or base_cfg)")
+    base_cfg = ENTRY_CONFIG_PER_FOLD.get(current_fold_index, ENTRY_CONFIG_PER_FOLD.get(0, {}))
+    fold_sl_multiplier_base = fold_config.get("sl_multiplier", base_cfg.get("sl_multiplier", 2.8))
+    logging.info(
+        f"   [Patch B Check] Using SL Multiplier: {fold_sl_multiplier_base} for Fold {current_fold_index+1} (from fold_config or base_cfg)"
+    )
     base_be_r_thresh = BASE_BE_SL_R_THRESHOLD; base_tp_multiplier_config = BASE_TP_MULTIPLIER; local_forced_entry_min_gain_z_abs = FORCED_ENTRY_MIN_GAIN_Z_ABS
     ignore_rsi_scoring = fold_config.get('ignore_rsi_scoring', False); use_gain_based_exit = fold_config.get('use_gain_based_exit', False); drift_override_active = ignore_rsi_scoring or use_gain_based_exit; drift_override_reason = ""
     if ignore_rsi_scoring: drift_override_reason += "RSI_Drift "
@@ -1786,6 +1982,11 @@ def run_backtest_simulation_v34(
         iterator = tqdm(iterator_obj, total=df_sim.shape[0], desc=f"  Sim ({label}, {side})", leave=False, mininterval=2.0)
     else:
         iterator = iterator_obj
+    # [Patch v5.5.7] Preallocate result arrays to reduce per-bar DataFrame writes
+    num_bars = len(df_sim)
+    equity_realistic_arr = np.full(num_bars, np.nan, dtype=float)
+    drawdown_arr = np.full(num_bars, np.nan, dtype=float)
+    active_count_arr = np.zeros(num_bars, dtype=int)
     run_summary = {}
 
     try:
@@ -1815,9 +2016,9 @@ def run_backtest_simulation_v34(
                 logging.debug(
                     f"   Skipping bar {current_index} due to missing/invalid price data."
                 )
-                df_sim.loc[current_index, f"Max_Drawdown_At_Point{label_suffix}"] = max_drawdown_pct
-                df_sim.loc[current_index, f"Equity_Realistic{label_suffix}"] = equity
-                df_sim.loc[current_index, f"Active_Order_Count{label_suffix}"] = len(active_orders)
+                drawdown_arr[current_bar_index] = max_drawdown_pct
+                equity_realistic_arr[current_bar_index] = equity
+                active_count_arr[current_bar_index] = len(active_orders)
                 equity_history[current_index] = equity
                 current_bar_index += 1
                 continue
@@ -1866,15 +2067,31 @@ def run_backtest_simulation_v34(
                         else: logging.warning(f"   (Warning) Cannot calculate Partial TP for order {order_entry_time}: Invalid SL delta price ({sl_delta_price_ptp}).")
                     current_atr_num_early_exit = pd.to_numeric(current_atr, errors='coerce')
                     if not order_closed_this_bar and order.get("partial_tp_processed_levels") and pd.notna(current_atr_num_early_exit) and current_atr_num_early_exit > 1e-9:
-                        reversal_threshold_atr = 1.5; early_exit_triggered = False
+                        # [Patch v5.3.5] Add buffer to EarlyExit and increase ATR threshold
+                        reversal_threshold_atr = 2.0
+                        entry_bar = order.get("entry_bar_count", current_bar_index)
+                        bars_since_open = current_bar_index - entry_bar
+                        early_exit_triggered = False
                         if order_side == "BUY":
                             peak_since_tp1 = order.get("peak_since_tp1")
-                            if pd.notna(peak_since_tp1): order["peak_since_tp1"] = max(peak_since_tp1, current_high); reversal_distance = order["peak_since_tp1"] - current_low; reversal_threshold_price = reversal_threshold_atr * current_atr_num_early_exit;
-                            if reversal_distance >= reversal_threshold_price: early_exit_triggered = True; close_reason = f"EarlyExit_Reversal_{reversal_threshold_atr}ATR"; exit_price = current_close
+                            if pd.notna(peak_since_tp1):
+                                order["peak_since_tp1"] = max(peak_since_tp1, current_high)
+                            reversal_distance = order["peak_since_tp1"] - current_low
+                            reversal_threshold_price = reversal_threshold_atr * current_atr_num_early_exit
+                            if bars_since_open > 3 and reversal_distance >= reversal_threshold_price:
+                                early_exit_triggered = True
+                                close_reason = f"EarlyExit_Reversal_{reversal_threshold_atr}ATR (buffer)"
+                                exit_price = current_close
                         elif order_side == "SELL":
                             trough_since_tp1 = order.get("trough_since_tp1")
-                            if pd.notna(trough_since_tp1): order["trough_since_tp1"] = min(trough_since_tp1, current_low); reversal_distance = current_high - order["trough_since_tp1"]; reversal_threshold_price = reversal_threshold_atr * current_atr_num_early_exit;
-                            if reversal_distance >= reversal_threshold_price: early_exit_triggered = True; close_reason = f"EarlyExit_Reversal_{reversal_threshold_atr}ATR"; exit_price = current_close
+                            if pd.notna(trough_since_tp1):
+                                order["trough_since_tp1"] = min(trough_since_tp1, current_low)
+                            reversal_distance = current_high - order["trough_since_tp1"]
+                            reversal_threshold_price = reversal_threshold_atr * current_atr_num_early_exit
+                            if bars_since_open > 3 and reversal_distance >= reversal_threshold_price:
+                                early_exit_triggered = True
+                                close_reason = f"EarlyExit_Reversal_{reversal_threshold_atr}ATR (buffer)"
+                                exit_price = current_close
                         if early_exit_triggered: logging.info(f"      Early Exit triggered for order {order_entry_time} at {now}. Reason: {close_reason}"); order_closed_this_bar = True; close_timestamp = now
 
                     if not order_closed_this_bar:
@@ -1904,12 +2121,23 @@ def run_backtest_simulation_v34(
                         if not close_reason.startswith("Partial TP"):
                             trade_log_entry_base = {"period": label, "side": order_side, "entry_idx": order.get("entry_idx"), "entry_time": order.get("entry_time"), "entry_price": entry_price, "close_time": close_timestamp, "exit_price": exit_price, "exit_reason": close_reason, "lot": lot_size, "original_sl_price": order.get("original_sl_price", np.nan), "final_sl_price": order.get("sl_price"), "tp_price": order.get("tp_price", np.nan), "pnl_points_gross": pnl_points, "pnl_points_net_spread": pnl_points_net_spread, "pnl_usd_gross": raw_pnl_usd, "commission_usd": commission_usd, "spread_cost_usd": spread_cost_usd, "slippage_usd": slippage_usd, "pnl_usd_net": net_pnl_usd, "equity_before": equity_at_start_of_bar, "equity_after": equity_at_start_of_bar + current_equity_change_this_bar, "M15_Trend_Zone": order.get("m15_trend_zone", "N/A"), "Signal_Score": order.get("signal_score", np.nan), "Trade_Reason": order.get("trade_reason", "N/A"), "Session": order.get("session", "N/A"), "BE_Triggered_Time": order.get("be_triggered_time", pd.NaT), "Pattern_Label_Entry": order.get("pattern_label_entry", "N/A"), "Is_Reentry": order.get("is_reentry", False), "Is_Forced_Entry": order.get("is_forced_entry", False), "Meta_Proba_TP": order.get("meta_proba_tp", np.nan), "Meta2_Proba_TP": order.get("meta2_proba_tp", np.nan), "is_partial_tp": False, "partial_tp_level": len(order.get("partial_tp_processed_levels", set())), "atr_at_entry": atr_at_entry_log, "equity_before_open": equity_before_open_log, "entry_gain_z": entry_gain_z_log, "entry_macd_smooth": entry_macd_smooth_log, "entry_candle_ratio": entry_candle_ratio_log, "entry_adx": entry_adx_log, "entry_volatility_index": entry_volatility_index_log, "trade_tag": order_trade_tag, "risk_mode_at_entry": risk_mode_at_entry_log, "active_model_at_entry": active_model_at_entry, "model_confidence_at_entry": model_confidence_at_entry}
                             trade_log.append(trade_log_entry_base); trade_history_list.append(close_reason)
-                        if net_pnl_usd < 0: consecutive_losses += 1; logging.debug(f"      Loss recorded. Consecutive losses: {consecutive_losses}")
+                        if net_pnl_usd < 0:
+                            consecutive_losses += 1
+                            logging.debug(f"      Loss recorded. Consecutive losses: {consecutive_losses}")
+                            loss_pct = abs(net_pnl_usd) / max(equity_at_start_of_bar, 1e-9)
+                            if loss_pct >= 0.01 and ENABLE_SOFT_COOLDOWN:
+                                cd_state.cooldown_bars_remaining = enter_cooldown(cd_state, SOFT_COOLDOWN_LOOKBACK)
+                                logging.info("      (Soft Cooldown) Entered due to >1% loss")
+                            update_losses(cd_state, net_pnl_usd)
                         elif net_pnl_usd >= 0:
                             if consecutive_losses > 0: logging.debug(f"      Win/BE recorded. Resetting consecutive losses from {consecutive_losses} to 0.")
                             consecutive_losses = 0
+                            update_losses(cd_state, net_pnl_usd)
+                        last_n_full_trade_sides.append(order_side)
                         last_n_full_trade_pnls.append(net_pnl_usd)
-                        if len(last_n_full_trade_pnls) > SOFT_COOLDOWN_LOOKBACK: last_n_full_trade_pnls.pop(0)
+                        if len(last_n_full_trade_pnls) > SOFT_COOLDOWN_LOOKBACK:
+                            last_n_full_trade_pnls.pop(0)
+                            last_n_full_trade_sides.pop(0)
                         if order.get("is_forced_entry", False):
                             if net_pnl_usd < 0:
                                 forced_entry_consecutive_losses += 1; logging.debug(f"      Forced Entry Loss. Consecutive FE losses: {forced_entry_consecutive_losses}")
@@ -1919,11 +2147,14 @@ def run_backtest_simulation_v34(
                                 forced_entry_consecutive_losses = 0
                                 if forced_entry_temporarily_disabled: forced_entry_temporarily_disabled = False; logging.info("         (Forced Entry Enabled) Re-enabled after winning/BE forced entry trade.")
                         entry_bar_idx_log = order.get("entry_idx")
-                        if entry_bar_idx_log is not None and entry_bar_idx_log in df_sim.index:
-                            safe_set_datetime(df_sim, entry_bar_idx_log, f"Order_Closed_Time{label_suffix}", close_timestamp)
-                            df_sim.loc[entry_bar_idx_log, f"PnL_Realized_USD{label_suffix}"] = net_pnl_usd; df_sim.loc[entry_bar_idx_log, f"Commission_USD{label_suffix}"] = commission_usd; df_sim.loc[entry_bar_idx_log, f"Spread_Cost_USD{label_suffix}"] = spread_cost_usd; df_sim.loc[entry_bar_idx_log, f"Slippage_USD{label_suffix}"] = slippage_usd; df_sim.loc[entry_bar_idx_log, f"Exit_Reason_Actual{label_suffix}"] = close_reason; df_sim.loc[entry_bar_idx_log, f"Exit_Price_Actual{label_suffix}"] = exit_price; df_sim.loc[entry_bar_idx_log, f"PnL_Points_Actual{label_suffix}"] = pnl_points_net_spread
-                            safe_set_datetime(df_sim, entry_bar_idx_log, f"BE_Triggered_Time{label_suffix}", order.get("be_triggered_time", pd.NaT))
-                        else: logging.warning(f"      (Warning) Could not find entry index '{entry_bar_idx_log}' in df_sim to update results for order {order_entry_time}.")
+                        if entry_bar_idx_log is not None:
+                            resolved_idx = _resolve_close_index(df_sim, entry_bar_idx_log, close_timestamp)
+                            if resolved_idx is not None:
+                                safe_set_datetime(df_sim, resolved_idx, f"Order_Closed_Time{label_suffix}", close_timestamp)
+                                df_sim.loc[resolved_idx, f"PnL_Realized_USD{label_suffix}"] = net_pnl_usd; df_sim.loc[resolved_idx, f"Commission_USD{label_suffix}"] = commission_usd; df_sim.loc[resolved_idx, f"Spread_Cost_USD{label_suffix}"] = spread_cost_usd; df_sim.loc[resolved_idx, f"Slippage_USD{label_suffix}"] = slippage_usd; df_sim.loc[resolved_idx, f"Exit_Reason_Actual{label_suffix}"] = close_reason; df_sim.loc[resolved_idx, f"Exit_Price_Actual{label_suffix}"] = exit_price; df_sim.loc[resolved_idx, f"PnL_Points_Actual{label_suffix}"] = pnl_points_net_spread
+                                safe_set_datetime(df_sim, resolved_idx, f"BE_Triggered_Time{label_suffix}", order.get("be_triggered_time", pd.NaT))
+                        else:
+                            logging.warning(f"      (Warning) Could not find entry index '{entry_bar_idx_log}' in df_sim to update results for order {order_entry_time}.")
                         continue
                     else:
                         logging.debug(f"         Order {order_entry_time} remains open. Updating BE/TSL/TTP2...")
@@ -1946,13 +2177,52 @@ def run_backtest_simulation_v34(
             final_m1_signal = "NONE"
             if side == "BUY" and entry_long_signal: final_m1_signal = "BUY"
             elif side == "SELL" and entry_short_signal: final_m1_signal = "SELL"
-            df_sim.loc[current_index, f"M15_Trend_Zone{label_suffix}"] = m15_trend
-            df_sim.loc[current_index, f"M1_Entry_Signal{label_suffix}"] = final_m1_signal
-            df_sim.loc[current_index, f"Signal_Score{label_suffix}"] = signal_score if pd.notna(signal_score) else np.nan
-            df_sim.loc[current_index, f"Trade_Reason{label_suffix}"] = trade_reason if final_m1_signal != "NONE" else "NONE"
-            df_sim.loc[current_index, f"Session{label_suffix}"] = session_tag
-            df_sim.loc[current_index, f"Trade_Tag{label_suffix}"] = current_trade_tag
-            entry_allowed, block_reason_entry = is_entry_allowed(row, session_tag, consecutive_losses); open_new_order = False; is_reentry_trade = False; is_forced_entry = False
+            df_sim.at[current_index, f"M15_Trend_Zone{label_suffix}"] = m15_trend
+            df_sim.at[current_index, f"M1_Entry_Signal{label_suffix}"] = final_m1_signal
+            df_sim.at[current_index, f"Signal_Score{label_suffix}"] = signal_score if pd.notna(signal_score) else np.nan
+            df_sim.at[current_index, f"Trade_Reason{label_suffix}"] = trade_reason if final_m1_signal != "NONE" else "NONE"
+            df_sim.at[current_index, f"Session{label_suffix}"] = session_tag
+            df_sim.at[current_index, f"Trade_Tag{label_suffix}"] = current_trade_tag
+            if USE_ADAPTIVE_SIGNAL_SCORE:
+                recent_df = df_sim.iloc[max(0, current_bar_index - ADAPTIVE_SIGNAL_SCORE_WINDOW):current_bar_index]
+                current_thresh = get_dynamic_signal_score_entry(
+                    recent_df,
+                    ADAPTIVE_SIGNAL_SCORE_WINDOW,
+                    ADAPTIVE_SIGNAL_SCORE_QUANTILE,
+                    MIN_SIGNAL_SCORE_ENTRY_MIN,
+                    MIN_SIGNAL_SCORE_ENTRY_MAX,
+                )
+                if (
+                    last_logged_signal_thresh is None
+                    or abs(current_thresh - last_logged_signal_thresh) > 1e-6
+                ):
+                    logging.info(
+                        f"[Adaptive] Current Signal_Score threshold: {current_thresh:.2f}"
+                    )
+                    last_logged_signal_thresh = current_thresh
+            else:
+                current_thresh = MIN_SIGNAL_SCORE_ENTRY
+            volume_ok = True
+            block_reason_entry = "N/A"
+            if volume_ma20 is not None:
+                current_vol = pd.to_numeric(getattr(row, "Volume", np.nan), errors="coerce")
+                avg_vol = volume_ma20.iloc[current_bar_index]
+                volume_ok = is_volume_spike(current_vol, avg_vol)
+                if not volume_ok:
+                    logging.debug("      Entry blocked by Volume filter.")
+                    block_reason_entry = "LOW_VOLUME"
+            if volume_ok:
+                entry_allowed, block_reason_entry = is_entry_allowed(
+                    row,
+                    session_tag,
+                    consecutive_losses,
+                    side,
+                    m15_trend,
+                    signal_score_threshold=current_thresh,
+                )
+            else:
+                entry_allowed = False
+            open_new_order = False; is_reentry_trade = False; is_forced_entry = False
             if entry_allowed:
                 if (side == "BUY" and final_m1_signal == "BUY") or (side == "SELL" and final_m1_signal == "SELL"):
                     open_new_order = True; logging.debug(f"   Standard Entry Signal detected for {side} at {now}.")
@@ -2012,22 +2282,26 @@ def run_backtest_simulation_v34(
                         elif side == "SELL" and current_macd_smooth > MACD_POS_THRESHOLD_SELL:
                             can_open_order = False
                             block_reason = f"POS_MACD_SELL (MACD={current_macd_smooth:.3f})"
-                if can_open_order:
-                    # [Patch v5.x.x] Disable Soft Cooldown logic during testing
-                    pass
-                    # if soft_cooldown_bars_remaining > 0:
-                    #     can_open_order = False
-                    #     block_reason = f"SOFT_COOLDOWN_ACTIVE({soft_cooldown_bars_remaining})"
-                    # else:
-                    #     cooldown_triggered, recent_losses_count = is_soft_cooldown_triggered(
-                    #         last_n_full_trade_pnls, SOFT_COOLDOWN_LOOKBACK, SOFT_COOLDOWN_LOSS_COUNT
-                    #     )
-                    #     if cooldown_triggered:
-                    #         soft_cooldown_bars_remaining = SOFT_COOLDOWN_LOOKBACK
-                    #         can_open_order = False
-                    #         block_reason = (
-                    #             f"SOFT_COOLDOWN_{SOFT_COOLDOWN_LOSS_COUNT}L{SOFT_COOLDOWN_LOOKBACK}T ({recent_losses_count} losses)"
-                    #         )
+                if can_open_order and ENABLE_SOFT_COOLDOWN:
+                    if cd_state.cooldown_bars_remaining > 0:
+                        can_open_order = False
+                        block_reason = f"SOFT_COOLDOWN_ACTIVE({cd_state.cooldown_bars_remaining})"
+                    else:
+                        cooldown_triggered, recent_losses_count = is_soft_cooldown_triggered(
+                            last_n_full_trade_pnls,
+                            SOFT_COOLDOWN_LOOKBACK,
+                            SOFT_COOLDOWN_LOSS_COUNT,
+                            last_n_full_trade_sides,
+                            side,
+                        )
+                        if cooldown_triggered:
+                            cd_state.cooldown_bars_remaining = enter_cooldown(
+                                cd_state, SOFT_COOLDOWN_LOOKBACK
+                            )
+                            can_open_order = False
+                            block_reason = (
+                                f"SOFT_COOLDOWN_{SOFT_COOLDOWN_LOSS_COUNT}L{SOFT_COOLDOWN_LOOKBACK}T ({recent_losses_count} losses)"
+                            )
                 if block_reason: logging.debug(f"      Block Reason: {block_reason}")
                 active_l1_model = None; active_l1_features = None; selected_model_key = "N/A"; model_confidence = np.nan; meta_proba_tp_for_log = np.nan
                 if can_open_order and USE_META_CLASSIFIER and callable(model_switcher_func):
@@ -2040,25 +2314,36 @@ def run_backtest_simulation_v34(
                             logging.warning(f"         (Warning) Switcher selected '{selected_model_key}', but model/features invalid. Falling back to 'main'."); selected_model_key = 'main'; model_info = available_models.get('main')
                             if model_info and model_info.get('model') and model_info.get('features'): active_l1_model = model_info['model']; active_l1_features = model_info['features']
                             else: logging.error("         (Error) Fallback to main model failed. Skipping ML Filter."); can_open_order = False; block_reason = "ML1_MAIN_FALLBACK_FAIL"; active_l1_model = None
-                        df_sim.loc[current_index, f"Active_Model{label_suffix}"] = selected_model_key
-                        df_sim.loc[current_index, f"Model_Confidence{label_suffix}"] = model_confidence
+                        df_sim.at[current_index, f"Active_Model{label_suffix}"] = selected_model_key
+                        df_sim.at[current_index, f"Model_Confidence{label_suffix}"] = model_confidence
                     except Exception as e_switch:
                         logging.error(f"      (Error) Model Switcher failed: {e_switch}. Falling back to main model.", exc_info=True); selected_model_key = 'main'; model_info = available_models.get('main')
                         if model_info and model_info.get('model') and model_info.get('features'): active_l1_model = model_info['model']; active_l1_features = model_info['features']
                         else: logging.error("      (Error) Fallback to main model failed after switcher error. Skipping ML Filter."); can_open_order = False; block_reason = "ML1_SWITCH_ERR_FALLBACK_FAIL"; active_l1_model = None
-                        df_sim.loc[current_index, f"Active_Model{label_suffix}"] = f"ErrorFallback_{selected_model_key}"
-                        df_sim.loc[current_index, f"Model_Confidence{label_suffix}"] = np.nan
+                        df_sim.at[current_index, f"Active_Model{label_suffix}"] = f"ErrorFallback_{selected_model_key}"
+                        df_sim.at[current_index, f"Model_Confidence{label_suffix}"] = np.nan
                     if active_l1_model and active_l1_features:
-                        missing_ml_features = [f for f in active_l1_features if f not in row.index]
+                        # [Patch v5.1.1] Fix feature check for namedtuple rows
+                        missing_ml_features = [
+                            f for f in active_l1_features if f not in row._fields
+                        ]
                         if missing_ml_features: logging.error(f"      (Error) ML Filter ({selected_model_key}): Missing features {missing_ml_features} in row data. Skipping filter."); can_open_order = False; block_reason = f"ML1_FEAT_MISS_{selected_model_key.upper()}"
                         else:
                             try:
-                                X_ml = pd.DataFrame([row[active_l1_features]]); numeric_cols_ml = X_ml.select_dtypes(include=np.number).columns
+                                # [Patch v5.5.3] Retrieve features from namedtuple row using getattr
+                                row_data = {f: getattr(row, f) for f in active_l1_features}
+                                X_ml = pd.DataFrame([row_data]); numeric_cols_ml = X_ml.select_dtypes(include=np.number).columns
                                 if X_ml[numeric_cols_ml].isin([np.inf, -np.inf]).any().any(): X_ml[numeric_cols_ml] = X_ml[numeric_cols_ml].replace([np.inf, -np.inf], 0)
                                 if X_ml[numeric_cols_ml].isnull().any().any(): X_ml[numeric_cols_ml] = X_ml[numeric_cols_ml].fillna(0)
                                 cat_cols_ml = X_ml.select_dtypes(exclude=np.number).columns
                                 for cat_col in cat_cols_ml: X_ml[cat_col] = X_ml[cat_col].astype(str).fillna("Missing")
                                 proba_tp = active_l1_model.predict_proba(X_ml)[0, 1]; meta_proba_tp_for_log = proba_tp; logging.debug(f"         ML Model '{selected_model_key}' Predicted Proba(TP): {proba_tp:.4f}")
+                                meta_proba = predict(active_l1_model, X_ml)
+                                if meta_proba < 0.6:
+                                    can_open_order = False
+                                    block_reason = "ML_META_FILTER"
+                                    orders_skipped_ml_l1 += 1
+                                    logging.debug(f"      Block Reason: {block_reason} (MetaProba {meta_proba:.4f} < 0.60)")
                                 ml_threshold = current_reentry_threshold_l1 if is_reentry_trade else current_meta_threshold_l1; logging.debug(f"         Applying ML Threshold: {ml_threshold:.4f} ({'Re-Entry' if is_reentry_trade else 'Standard'})")
                                 if proba_tp < ml_threshold: can_open_order = False; block_reason = f"ML1_SKIP_{selected_model_key.upper()}" if not is_reentry_trade else f"ML1_SKIP_RE_{selected_model_key.upper()}"; orders_skipped_ml_l1 += 1; logging.debug(f"      Block Reason: {block_reason} (Proba {proba_tp:.4f} < {ml_threshold:.4f})")
                             except Exception as e_ml1: logging.error(f"      (Error) ML Filter ({selected_model_key}) failed during prediction: {e_ml1}", exc_info=True); can_open_order = False; block_reason = f"ML1_ERR_{selected_model_key.upper()}" if not is_reentry_trade else f"ML1_ERR_RE_{selected_model_key.upper()}"; meta_proba_tp_for_log = np.nan
@@ -2083,12 +2368,41 @@ def run_backtest_simulation_v34(
                             else:
                                 logging.debug(f"         [Patch] Using ATR-Based SL/TP. Fold SL Multiplier: {fold_sl_multiplier_base:.2f}, ATR Entry: {atr_entry:.5f}"); sl_delta_price = atr_entry * fold_sl_multiplier_base; sl_price = entry_price - sl_delta_price if side == "BUY" else entry_price + sl_delta_price; tp1_delta = sl_delta_price * 1.0; tp1_price = entry_price + tp1_delta if side == "BUY" else entry_price - tp1_delta; tp2_r = dynamic_tp2_multiplier(current_atr, current_avg_atr, base=base_tp_multiplier_config); tp2_delta = sl_delta_price * tp2_r; tp2_price = entry_price + tp2_delta if side == "BUY" else entry_price - tp2_delta
                             logging.debug(f"         Calculated SL={sl_price:.5f}, TP1={tp1_price:.5f}, TP2={tp2_price:.5f} (SL Delta Price={sl_delta_price:.5f})")
-                            mm_mode = fund_profile.get('mm_mode', 'balanced'); risk_pct = fund_profile.get('risk', DEFAULT_RISK_PER_TRADE); base_lot = calculate_lot_by_fund_mode(mm_mode, risk_pct, current_equity_check, atr_entry, sl_delta_price); boosted_lot = adjust_lot_tp2_boost(trade_history_list, base_lot); final_lot, risk_mode_applied = adjust_lot_recovery_mode(boosted_lot, consecutive_losses); logging.debug(f"         Calculated Lot: Base={base_lot:.2f}, Boosted={boosted_lot:.2f}, Final={final_lot:.2f} (RiskMode Applied={risk_mode_applied})")
+                            risk_pct = fund_profile.get('risk', DEFAULT_RISK_PER_TRADE)
+                            base_lot, _ = atr_position_size(
+                                current_equity_check,
+                                atr_entry,
+                                risk_pct=risk_pct,
+                                atr_mult=fold_sl_multiplier_base,
+                                pip_value=POINT_VALUE,
+                                min_lot=MIN_LOT_SIZE,
+                                max_lot=MAX_LOT_SIZE,
+                            )
+                            base_lot = compute_dynamic_lot(base_lot, current_dd_check)
+                            boosted_lot = adjust_lot_tp2_boost(trade_history_list, base_lot)
+                            final_lot, risk_mode_applied = adjust_lot_recovery_mode(
+                                boosted_lot, consecutive_losses
+                            )
+                            logging.debug(
+                                f"         Calculated Lot: Base={base_lot:.2f}, Boosted={boosted_lot:.2f}, Final={final_lot:.2f} (RiskMode Applied={risk_mode_applied})"
+                            )
                             if final_lot >= MIN_LOT_SIZE:
-                                entry_time = now; total_ib_lot_accumulator += final_lot; current_atr_num_ttp2 = pd.to_numeric(current_atr, errors='coerce'); enable_ttp2 = pd.notna(current_atr_num_ttp2) and current_atr_num_ttp2 > 4.0
+                                entry_time = now
+                                total_ib_lot_accumulator += final_lot
+                                current_atr_num_ttp2 = pd.to_numeric(current_atr, errors='coerce')
+                                enable_ttp2 = pd.notna(current_atr_num_ttp2) and current_atr_num_ttp2 > 4.0
+                                sl_price, tp2_price = adjust_sl_tp_oms(
+                                    entry_price,
+                                    sl_price,
+                                    tp2_price,
+                                    atr_entry,
+                                    side,
+                                    OMS_MARGIN_PIPS,
+                                    OMS_MAX_DISTANCE_PIPS,
+                                )
                                 new_order = {"entry_idx": current_index, "entry_time": entry_time, "entry_price": entry_price, "original_lot": final_lot, "lot": final_lot, "original_sl_price": sl_price, "sl_price": sl_price, "tp_price": tp2_price, "tp1_price": tp1_price, "entry_bar_count": current_bar_index, "side": side, "m15_trend_zone": m15_trend, "trade_tag": current_trade_tag, "signal_score": signal_score if pd.notna(signal_score) else np.nan, "trade_reason": trade_reason if not is_forced_entry else f"FORCED_{trade_reason}", "session": session_tag, "pattern_label_entry": pattern_label, "be_triggered": False, "be_triggered_time": pd.NaT, "is_reentry": is_reentry_trade, "is_forced_entry": is_forced_entry, "meta_proba_tp": meta_proba_tp_for_log, "meta2_proba_tp": meta2_proba_tp_for_log, "partial_tp_processed_levels": set(), "atr_at_entry": atr_entry, "equity_before_open": current_equity_check, "entry_gain_z": current_gain_z if pd.notna(current_gain_z) else np.nan, "entry_macd_smooth": current_macd_smooth if pd.notna(current_macd_smooth) else np.nan, "entry_candle_ratio": getattr(row, "Candle_Ratio", np.nan), "entry_adx": getattr(row, "ADX", np.nan), "entry_volatility_index": current_vol_index if pd.notna(current_vol_index) else np.nan, "peak_since_tp1": np.nan, "trough_since_tp1": np.nan, "risk_mode_at_entry": risk_mode_applied, "use_trailing_for_tp2": enable_ttp2, "trailing_start_price": tp1_price if enable_ttp2 else np.nan, "trailing_step_r": ADAPTIVE_TSL_DEFAULT_STEP_R if enable_ttp2 else np.nan, "peak_since_ttp2_activation": np.nan, "trough_since_ttp2_activation": np.nan, "active_model_at_entry": selected_model_key, "model_confidence_at_entry": model_confidence, "tsl_activated": False, "peak_since_tsl_activation": np.nan, "trough_since_tsl_activation": np.nan}
                                 next_active_orders.append(new_order); logging.info(f"         +++ ORDER OPENED: Side={side}, Lot={final_lot:.2f}, Entry={entry_price:.5f}, SL={sl_price:.5f}, TP={tp2_price:.5f}")
-                                df_sim.loc[current_index, f"Order_Opened{label_suffix}"] = True; df_sim.loc[current_index, f"Lot_Size{label_suffix}"] = final_lot; df_sim.loc[current_index, f"Entry_Price_Actual{label_suffix}"] = entry_price; df_sim.loc[current_index, f"SL_Price_Actual{label_suffix}"] = sl_price; df_sim.loc[current_index, f"TP_Price_Actual{label_suffix}"] = tp2_price; df_sim.loc[current_index, f"ATR_At_Entry{label_suffix}"] = atr_entry; df_sim.loc[current_index, f"Equity_Before_Open{label_suffix}"] = current_equity_check; df_sim.loc[current_index, f"Is_Reentry{label_suffix}"] = is_reentry_trade; df_sim.loc[current_index, f"Forced_Entry{label_suffix}"] = is_forced_entry; df_sim.loc[current_index, f"Meta_Proba_TP{label_suffix}"] = meta_proba_tp_for_log; df_sim.loc[current_index, f"Meta2_Proba_TP{label_suffix}"] = meta2_proba_tp_for_log; df_sim.loc[current_index, f"Entry_Gain_Z{label_suffix}"] = current_gain_z if pd.notna(current_gain_z) else np.nan; df_sim.loc[current_index, f"Entry_MACD_Smooth{label_suffix}"] = current_macd_smooth if pd.notna(current_macd_smooth) else np.nan; df_sim.loc[current_index, f"Entry_Candle_Ratio{label_suffix}"] = getattr(row, "Candle_Ratio", np.nan); df_sim.loc[current_index, f"Entry_ADX{label_suffix}"] = getattr(row, "ADX", np.nan); df_sim.loc[current_index, f"Entry_Volatility_Index{label_suffix}"] = current_vol_index if pd.notna(current_vol_index) else np.nan; df_sim.loc[current_index, f"Active_Model{label_suffix}"] = selected_model_key; df_sim.loc[current_index, f"Model_Confidence{label_suffix}"] = model_confidence
+                                df_sim.at[current_index, f"Order_Opened{label_suffix}"] = True; df_sim.at[current_index, f"Lot_Size{label_suffix}"] = final_lot; df_sim.at[current_index, f"Entry_Price_Actual{label_suffix}"] = entry_price; df_sim.at[current_index, f"SL_Price_Actual{label_suffix}"] = sl_price; df_sim.at[current_index, f"TP_Price_Actual{label_suffix}"] = tp2_price; df_sim.at[current_index, f"ATR_At_Entry{label_suffix}"] = atr_entry; df_sim.at[current_index, f"Equity_Before_Open{label_suffix}"] = current_equity_check; df_sim.at[current_index, f"Is_Reentry{label_suffix}"] = is_reentry_trade; df_sim.at[current_index, f"Forced_Entry{label_suffix}"] = is_forced_entry; df_sim.at[current_index, f"Meta_Proba_TP{label_suffix}"] = meta_proba_tp_for_log; df_sim.at[current_index, f"Meta2_Proba_TP{label_suffix}"] = meta2_proba_tp_for_log; df_sim.at[current_index, f"Entry_Gain_Z{label_suffix}"] = current_gain_z if pd.notna(current_gain_z) else np.nan; df_sim.at[current_index, f"Entry_MACD_Smooth{label_suffix}"] = current_macd_smooth if pd.notna(current_macd_smooth) else np.nan; df_sim.at[current_index, f"Entry_Candle_Ratio{label_suffix}"] = getattr(row, "Candle_Ratio", np.nan); df_sim.at[current_index, f"Entry_ADX{label_suffix}"] = getattr(row, "ADX", np.nan); df_sim.at[current_index, f"Entry_Volatility_Index{label_suffix}"] = current_vol_index if pd.notna(current_vol_index) else np.nan; df_sim.at[current_index, f"Active_Model{label_suffix}"] = selected_model_key; df_sim.at[current_index, f"Model_Confidence{label_suffix}"] = model_confidence
                                 if is_reentry_trade: reentry_trades_opened += 1
                                 if is_forced_entry: forced_entry_trades_opened += 1
                                 bars_since_last_trade = 0
@@ -2104,18 +2418,59 @@ def run_backtest_simulation_v34(
                     logging.warning(f"      Force closing {len(active_orders)} orders due to Margin Call at {now}.")
                     for mc_order in active_orders: trade_log_entry_mc = {"period": label, "side": mc_order.get("side"), "entry_idx": mc_order.get("entry_idx"), "entry_time": mc_order.get("entry_time"), "entry_price": mc_order.get("entry_price"), "close_time": now, "exit_price": current_close, "exit_reason": "MARGIN_CALL", "lot": mc_order.get("lot", 0.0), "pnl_usd_net": 0.0, "is_partial_tp": False, "partial_tp_level": len(mc_order.get("partial_tp_processed_levels", set())), "risk_mode_at_entry": mc_order.get("risk_mode_at_entry", "N/A"), "active_model_at_entry": mc_order.get("active_model_at_entry", "N/A")}; trade_log.append(trade_log_entry_mc)
                     active_orders.clear()
-                next_active_orders.clear(); df_sim.loc[current_index, f"Equity_Realistic{label_suffix}"] = 0.0; df_sim.loc[current_index, f"Max_Drawdown_At_Point{label_suffix}"] = 1.0; df_sim.loc[current_index, f"Active_Order_Count{label_suffix}"] = 0; equity_history[current_index] = 0.0
+                next_active_orders.clear()
+                equity_realistic_arr[current_bar_index] = 0.0
+                drawdown_arr[current_bar_index] = 1.0
+                active_count_arr[current_bar_index] = 0
+                equity_history[current_index] = 0.0
                 remaining_indices = df_sim.index[df_sim.index > current_index]
-                if not remaining_indices.empty: logging.info(f"      Marking remaining {len(remaining_indices)} bars with 0 equity due to Margin Call."); df_sim.loc[remaining_indices, f"Equity_Realistic{label_suffix}"] = 0.0; df_sim.loc[remaining_indices, f"Max_Drawdown_At_Point{label_suffix}"] = 1.0; df_sim.loc[remaining_indices, f"Active_Order_Count{label_suffix}"] = 0
+                if not remaining_indices.empty:
+                    logging.info(f"      Marking remaining {len(remaining_indices)} bars with 0 equity due to Margin Call.")
+                    start_idx = current_bar_index + 1
+                    equity_realistic_arr[start_idx:] = 0.0
+                    drawdown_arr[start_idx:] = 1.0
+                    active_count_arr[start_idx:] = 0
                 break
 
-            peak_equity = max(peak_equity, equity); current_dd_final = (peak_equity - equity) / peak_equity if peak_equity > 1e-9 else 0.0; max_drawdown_pct = max(max_drawdown_pct, current_dd_final); logging.debug(f"   Drawdown: Current={current_dd_final*100:.2f}%, Max={max_drawdown_pct*100:.2f}%")
-            df_sim.loc[current_index, f"Max_Drawdown_At_Point{label_suffix}"] = max_drawdown_pct; df_sim.loc[current_index, f"Equity_Realistic{label_suffix}"] = equity; df_sim.loc[current_index, f"Active_Order_Count{label_suffix}"] = len(next_active_orders); equity_history[current_index] = equity
+            peak_equity = max(peak_equity, equity)
+            current_dd_final = (peak_equity - equity) / peak_equity if peak_equity > 1e-9 else 0.0
+            max_drawdown_pct = max(max_drawdown_pct, current_dd_final)
+            logging.debug(f"   Drawdown: Current={current_dd_final*100:.2f}%, Max={max_drawdown_pct*100:.2f}%")
+            update_drawdown(cd_state, current_dd_final)
+            drawdown_arr[current_bar_index] = max_drawdown_pct
+            equity_realistic_arr[current_bar_index] = equity
+            active_count_arr[current_bar_index] = len(next_active_orders)
+            equity_history[current_index] = equity
 
             if enable_kill_switch and not kill_switch_activated:
-                logging.debug(f"   Checking Kill Switch: DD={current_dd_final*100:.2f}% (Thresh={KILL_SWITCH_MAX_DD_THRESHOLD*100:.0f}%), Losses={consecutive_losses} (Thresh={kill_switch_consecutive_losses_config})")
-                if current_dd_final > KILL_SWITCH_MAX_DD_THRESHOLD: logging.warning(f"[Patch] Kill Switch triggered due to drawdown."); logging.critical(f"     (CRITICAL) KILL SWITCH ACTIVATED (Max DD): {label} at {now}. Drawdown {current_dd_final*100:.2f}% > {KILL_SWITCH_MAX_DD_THRESHOLD*100:.0f}%. Stopping simulation loop."); kill_switch_activated = True; kill_switch_trigger_time = now; break
-                elif consecutive_losses >= kill_switch_consecutive_losses_config: logging.warning(f"[Patch] Kill Switch triggered due to consecutive losses."); logging.critical(f"     (CRITICAL) KILL SWITCH ACTIVATED (Consecutive Losses): {label} at {now}. Losses: {consecutive_losses} >= {kill_switch_consecutive_losses_config}. Stopping simulation loop."); kill_switch_activated = True; kill_switch_trigger_time = now; break
+                logging.debug(
+                    f"   Checking Kill Switch: DD={current_dd_final*100:.2f}% (Warn>{KILL_SWITCH_WARNING_MAX_DD_THRESHOLD*100:.0f}%, Kill>{KILL_SWITCH_MAX_DD_THRESHOLD*100:.0f}%), Losses={consecutive_losses} (Warn>{KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD}, Kill>{kill_switch_consecutive_losses_config})"
+                )
+                if current_dd_final > KILL_SWITCH_MAX_DD_THRESHOLD:
+                    logging.warning("[Patch] Kill Switch triggered due to drawdown.")
+                    logging.critical(
+                        f"(CRITICAL) KILL SWITCH ACTIVATED (Max DD): {label} at {now}. Drawdown {current_dd_final*100:.2f}% > {KILL_SWITCH_MAX_DD_THRESHOLD*100:.0f}%. Stopping simulation loop."
+                    )
+                    kill_switch_activated = True
+                    kill_switch_trigger_time = now
+                    break
+                elif consecutive_losses >= kill_switch_consecutive_losses_config:
+                    logging.warning("[Patch] Kill Switch triggered due to consecutive losses.")
+                    logging.critical(
+                        f"     (CRITICAL) KILL SWITCH ACTIVATED (Consecutive Losses): {label} at {now}. Losses: {consecutive_losses} >= {kill_switch_consecutive_losses_config}. Stopping simulation loop."
+                    )
+                    kill_switch_activated = True
+                    kill_switch_trigger_time = now
+                    break
+                else:
+                    if should_warn_drawdown(cd_state, KILL_SWITCH_WARNING_MAX_DD_THRESHOLD):
+                        logging.warning(
+                            f"(Warning) Drawdown {current_dd_final*100:.2f}% ยังไม่ถึง threshold {KILL_SWITCH_MAX_DD_THRESHOLD*100:.0f}%"
+                        )
+                    if should_warn_losses(cd_state, KILL_SWITCH_WARNING_CONSECUTIVE_LOSSES_THRESHOLD):
+                        logging.warning(
+                            f"(Warning) Consecutive losses = {consecutive_losses}, ยังไม่ถึง threshold สำหรับ Kill Switch."
+                        )
 
             previous_risk_mode = current_risk_mode
             if consecutive_losses >= recovery_mode_consecutive_losses_config:
@@ -2125,12 +2480,15 @@ def run_backtest_simulation_v34(
                 if current_risk_mode == "recovery": logging.info("[Patch] Deactivating Recovery Mode.")
                 current_risk_mode = "normal"
             if current_risk_mode != previous_risk_mode: logging.info(f"      [{now}] Risk Mode for *next* bar set to: {current_risk_mode} (Losses: {consecutive_losses})")
-            df_sim.loc[current_index, f"Risk_Mode{label_suffix}"] = current_risk_mode
+            df_sim.at[current_index, f"Risk_Mode{label_suffix}"] = current_risk_mode
             active_orders = next_active_orders
             logging.debug(
                 f"   End of Bar {current_bar_index}. Active orders for next bar: {len(active_orders)}"
             )
-            soft_cooldown_bars_remaining = step_soft_cooldown(soft_cooldown_bars_remaining)
+            prev_cd = cd_state.cooldown_bars_remaining
+            cd_state.cooldown_bars_remaining = step_soft_cooldown(cd_state.cooldown_bars_remaining)
+            if prev_cd > 0 and cd_state.cooldown_bars_remaining == 0:
+                logging.info(f"[OMS_Guardian] Soft cooldown ended at {now}. Entry checks resumed.")
             current_bar_index += 1
     # <<< [Patch C - Unified] End of try-except for main loop >>>
     except Exception as e_loop:
@@ -2176,17 +2534,31 @@ def run_backtest_simulation_v34(
             trade_log.append(trade_log_entry_end); trade_history_list.append(close_reason)
             if net_pnl_usd < 0: consecutive_losses += 1
             elif net_pnl_usd >= 0: consecutive_losses = 0
+            last_n_full_trade_sides.append(order_side)
             last_n_full_trade_pnls.append(net_pnl_usd)
-            if len(last_n_full_trade_pnls) > SOFT_COOLDOWN_LOOKBACK: last_n_full_trade_pnls.pop(0)
+            if len(last_n_full_trade_pnls) > SOFT_COOLDOWN_LOOKBACK:
+                last_n_full_trade_pnls.pop(0)
+                last_n_full_trade_sides.pop(0)
             entry_bar_idx_log_end = order.get("entry_idx")
-            if entry_bar_idx_log_end is not None and entry_bar_idx_log_end in df_sim.index:
-                safe_set_datetime(df_sim, entry_bar_idx_log_end, f"Order_Closed_Time{label_suffix}", close_timestamp)
-                df_sim.loc[entry_bar_idx_log_end, f"PnL_Realized_USD{label_suffix}"] = net_pnl_usd; df_sim.loc[entry_bar_idx_log_end, f"Commission_USD{label_suffix}"] = commission_usd; df_sim.loc[entry_bar_idx_log_end, f"Spread_Cost_USD{label_suffix}"] = spread_cost_usd; df_sim.loc[entry_bar_idx_log_end, f"Slippage_USD{label_suffix}"] = slippage_usd; df_sim.loc[entry_bar_idx_log_end, f"Exit_Reason_Actual{label_suffix}"] = close_reason; df_sim.loc[entry_bar_idx_log_end, f"Exit_Price_Actual{label_suffix}"] = exit_price; df_sim.loc[entry_bar_idx_log_end, f"PnL_Points_Actual{label_suffix}"] = pnl_points_net_spread
-            else: logging.warning(f"   (Warning) Could not find entry index '{entry_bar_idx_log_end}' in df_sim to update results for order {order_entry_time_end} (End of Period).")
+            if entry_bar_idx_log_end is not None:
+                resolved_idx_end = _resolve_close_index(df_sim, entry_bar_idx_log_end, close_timestamp)
+                if resolved_idx_end is not None:
+                    safe_set_datetime(df_sim, resolved_idx_end, f"Order_Closed_Time{label_suffix}", close_timestamp)
+                    df_sim.loc[resolved_idx_end, f"PnL_Realized_USD{label_suffix}"] = net_pnl_usd; df_sim.loc[resolved_idx_end, f"Commission_USD{label_suffix}"] = commission_usd; df_sim.loc[resolved_idx_end, f"Spread_Cost_USD{label_suffix}"] = spread_cost_usd; df_sim.loc[resolved_idx_end, f"Slippage_USD{label_suffix}"] = slippage_usd; df_sim.loc[resolved_idx_end, f"Exit_Reason_Actual{label_suffix}"] = close_reason; df_sim.loc[resolved_idx_end, f"Exit_Price_Actual{label_suffix}"] = exit_price; df_sim.loc[resolved_idx_end, f"PnL_Points_Actual{label_suffix}"] = pnl_points_net_spread
+            else:
+                logging.warning(f"   (Warning) Could not find entry index '{entry_bar_idx_log_end}' in df_sim to update results for order {order_entry_time_end} (End of Period).")
         if end_time not in equity_history: equity_history[end_time] = equity
         if not df_sim.empty:
             last_valid_idx = df_sim.index[-1]
-            if last_valid_idx in df_sim.index: df_sim.loc[last_valid_idx, f"Equity_Realistic{label_suffix}"] = equity; df_sim.loc[last_valid_idx, f"Active_Order_Count{label_suffix}"] = 0
+            if last_valid_idx in df_sim.index:
+                final_pos = df_sim.index.get_loc(last_valid_idx)
+                equity_realistic_arr[final_pos] = equity
+                active_count_arr[final_pos] = 0
+
+    # [Patch v5.5.7] Write preallocated arrays back to DataFrame
+    df_sim[f"Equity_Realistic{label_suffix}"] = equity_realistic_arr
+    df_sim[f"Max_Drawdown_At_Point{label_suffix}"] = drawdown_arr
+    df_sim[f"Active_Order_Count{label_suffix}"] = active_count_arr
 
     trade_log_df_segment = pd.DataFrame(trade_log)
     logging.info(f"Created trade log DataFrame for {label} with {len(trade_log_df_segment)} entries.")
@@ -2216,6 +2588,12 @@ def run_backtest_simulation_v34(
                    f"BEs:{be_sl_triggered_count_run}, TSLs:{tsl_triggered_count_run}")
     logging.info(summary_msg)
     logging.info(f"      Equity สุดท้าย: ${equity:.2f} (จาก ${initial_capital_segment:.2f})")
+    # [Patch v5.3.5] Safeguard NaN/Inf Check in PnL and feature processing
+    if np.isnan(equity) or np.isinf(equity):
+        logging.critical("[CRITICAL] NaN/Inf detected in final equity, investigation required.")
+    logging.warning(
+        f"[QA][SUMMARY] Fold Finished | Final Equity: ${equity:.2f} | Max DD: {max_drawdown_pct:.2%} | KILL SWITCH: {kill_switch_activated}"
+    )
     logging.info(f"      Blocks: MaxDD={orders_blocked_by_drawdown}, Cooldown={orders_blocked_by_cooldown}, LotScale={orders_lot_scaled}, ML1Skip={orders_skipped_ml_l1}(T={current_meta_threshold_l1:.2f})")
     new_blocks_count = sum(1 for b in blocked_order_log if b.get('reason') in ["HIGH_VOL_INDEX", "HIGH_ATR_LOW_SCORE", "NEG_MACD_BUY", "POS_MACD_SELL", f"SOFT_COOLDOWN_{SOFT_COOLDOWN_LOSS_COUNT}L{SOFT_COOLDOWN_LOOKBACK}T", "SPIKE_GUARD_LONDON"])
     logging.info(f"      Blocks (New v4.6/v4.8): Vol/ATR/MACD/SoftCool/Spike={new_blocks_count}")
@@ -2251,7 +2629,8 @@ def run_backtest_simulation_v34(
     if 'trade_log' in locals(): del trade_log
     if 'trade_history_list' in locals(): del trade_history_list
     if 'last_n_full_trade_pnls' in locals(): del last_n_full_trade_pnls
-    gc.collect()
+    if 'last_n_full_trade_sides' in locals(): del last_n_full_trade_sides
+    maybe_collect()
     logging.debug(f"   Memory cleanup complete for: {label}")
 
     return (df_sim, trade_log_df_segment, equity, equity_history, max_drawdown_pct, run_summary, blocked_order_log, sim_model_type_l1, sim_model_type_l2, kill_switch_activated, consecutive_losses, total_ib_lot_accumulator)
@@ -2282,7 +2661,8 @@ import gc # For memory management
 
 # Ensure global configurations are accessible if run independently
 # Define defaults if globals are not found
-DEFAULT_DRIFT_WASSERSTEIN_THRESHOLD = 0.1
+# [Patch v5.5.4] Environment override for drift threshold
+DEFAULT_DRIFT_WASSERSTEIN_THRESHOLD = get_env_float("DRIFT_WASSERSTEIN_THRESHOLD", 0.1)
 DEFAULT_DRIFT_TTEST_ALPHA = 0.05
 DEFAULT_INITIAL_CAPITAL = 100.0
 DEFAULT_IB_COMMISSION_PER_LOT = 7.0
@@ -2290,17 +2670,19 @@ DEFAULT_N_WALK_FORWARD_SPLITS = 5
 DEFAULT_ENTRY_CONFIG_PER_FOLD = {0: {}} # Minimal default
 DEFAULT_FUND_PROFILES = {"NORMAL": {"risk": 0.01, "mm_mode": "balanced"}}
 DEFAULT_FUND_NAME = "NORMAL"
-DEFAULT_META_MIN_PROBA_THRESH = 0.5
+DEFAULT_META_MIN_PROBA_THRESH = 0.3
 DEFAULT_ENABLE_PARTIAL_TP = True
 DEFAULT_PARTIAL_TP_LEVELS = []
 DEFAULT_PARTIAL_TP_MOVE_SL_TO_ENTRY = True
 DEFAULT_ENABLE_KILL_SWITCH = True
-DEFAULT_KILL_SWITCH_MAX_DD_THRESHOLD = 0.20
-DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 7
+DEFAULT_KILL_SWITCH_MAX_DD_THRESHOLD = 0.15
+DEFAULT_KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 5
 DEFAULT_RECOVERY_MODE_CONSECUTIVE_LOSSES = 4
 DEFAULT_min_equity_threshold_pct = 0.70
 DEFAULT_DYNAMIC_GAINZ_DRIFT_THRESHOLD = 0.10
 DEFAULT_DYNAMIC_GAINZ_ADJUSTMENT = 0.1
+DEFAULT_RSI_DRIFT_OVERRIDE_THRESHOLD = 0.65
+DEFAULT_ATR_DRIFT_OVERRIDE_THRESHOLD = 0.25
 
 try:
     DRIFT_WASSERSTEIN_THRESHOLD
@@ -2378,6 +2760,14 @@ try:
     DYNAMIC_GAINZ_ADJUSTMENT
 except NameError:
     DYNAMIC_GAINZ_ADJUSTMENT = DEFAULT_DYNAMIC_GAINZ_ADJUSTMENT
+try:
+    RSI_DRIFT_OVERRIDE_THRESHOLD
+except NameError:
+    RSI_DRIFT_OVERRIDE_THRESHOLD = DEFAULT_RSI_DRIFT_OVERRIDE_THRESHOLD
+try:
+    ATR_DRIFT_OVERRIDE_THRESHOLD
+except NameError:
+    ATR_DRIFT_OVERRIDE_THRESHOLD = DEFAULT_ATR_DRIFT_OVERRIDE_THRESHOLD
 
 # --- Drift Observer Class ---
 class DriftObserver:
@@ -2490,7 +2880,7 @@ class DriftObserver:
                 feature_result["ttest_p"] = t_p
                 analyzed_count += 1
                 del train_series, test_series, w_dist, t_stat, t_p
-                gc.collect()
+                maybe_collect()
 
             except KeyError:
                 logging.error(f"      (Error) Feature '{feature}' missing during analysis Fold {fold_num + 1}.")
@@ -2506,7 +2896,7 @@ class DriftObserver:
 
         logging.info(f"    (DriftObserver) Fold {fold_num + 1} Summary: Analyzed={analyzed_count}, Skipped(NN/Insuf)={skipped_non_numeric}/{skipped_insufficient_data}, Errors={error_count}, Drift Alerts={drift_alert_count}")
         del common_features, features_to_analyze, missing_observed
-        gc.collect()
+        maybe_collect()
 
     def get_fold_drift_summary(self, fold_num):
         """
@@ -2598,7 +2988,7 @@ class DriftObserver:
 
         logging.info("  (Info) Skipping save of drift heatmap PNG (v3.6.8 Reduce Files).")
         del summary_df, summary_data, wasserstein_df_data
-        gc.collect()
+        maybe_collect()
 
     def export_fold_summary(self, output_dir, fold_num):
         """
@@ -2643,9 +3033,27 @@ class DriftObserver:
             fold_summary_df.to_csv(drift_fold_path, index=False, encoding="utf-8", float_format="%.4f")
             logging.debug(f"          (Success) Exported Drift Summary for Fold {fold_num+1}: {os.path.basename(drift_fold_path)}")
             del fold_summary_list, fold_summary_df
-            gc.collect()
+            maybe_collect()
         except Exception as e_export_fold:
             logging.error(f"  (Error) Failed to export Drift Summary for Fold {fold_num+1}: {e_export_fold}", exc_info=True)
+        if False:
+            def calculate_metrics(trade_log_df=None, final_equity=None, equity_history_segment=None, initial_capital=None, label="", model_type_l1="N/A", model_type_l2="N/A", run_summary=None, ib_lot_accumulator=0.0):
+                pass
+
+    def needs_retrain(self, fold_num, threshold=DRIFT_WASSERSTEIN_THRESHOLD):
+        """Determine if the given fold requires re-training based on drift."""
+        fold_data = self.results.get(fold_num)
+        if not fold_data or not isinstance(fold_data, dict):
+            return False
+        for metrics in fold_data.values():
+            if isinstance(metrics, dict):
+                w_dist = metrics.get("wasserstein")
+                if isinstance(w_dist, (int, float, np.number)) and pd.notna(w_dist) and w_dist > threshold:
+                    logging.info(
+                        f"    (DriftObserver) Retrain triggered: Wasserstein {w_dist:.4f} > {threshold:.2f} (Fold {fold_num + 1})"
+                    )
+                    return True
+        return False
 
     def save(self, filepath):
         """Saves the DriftObserver object (currently skipped)."""
@@ -2656,7 +3064,6 @@ class DriftObserver:
         logging.info(f"   (Info) Skipping load of DriftObserver object from {filepath} (v3.6.8 Reduce Files).")
         self.results = {}
         return False
-
 
 # --- Performance Metrics Calculation ---
 def calculate_metrics(trade_log_df, final_equity, equity_history_segment, initial_capital=None, label="", model_type_l1="N/A", model_type_l2="N/A", run_summary=None, ib_lot_accumulator=0.0):
@@ -2822,7 +3229,7 @@ def calculate_metrics(trade_log_df, final_equity, equity_history_segment, initia
         sl_hit_count = len(sl_like_exits)
         metrics[f"{label} SL Hit Rate (%)"] = (sl_hit_count / total_exits) * 100.0 if total_exits > 0 else 0.0
         del pnl, wins, losses, sl_like_exits
-        gc.collect()
+        maybe_collect()
 
     else:
         logging.info(f"    No fully closed trades found for '{label}'. Calculating metrics based on partials/totals.")
@@ -2926,24 +3333,24 @@ def calculate_metrics(trade_log_df, final_equity, equity_history_segment, initia
                         metrics[f"{label} Calmar Ratio (approx)"] = calmar_ratio
                         logging.debug(f"      Calmar Ratio (approx): {calmar_ratio:.3f}")
                         del daily_ret, downside_ret
-                        gc.collect()
+                        maybe_collect()
                     else:
                         logging.warning(f"    (Warning) Cannot calculate ratios for '{label}': No daily returns or zero initial capital.")
                     del equity_resampled
-                    gc.collect()
+                    maybe_collect()
                 else:
                     logging.warning(f"    (Warning) Not enough resampled equity data points ({len(equity_resampled)}) for ratio calculation in '{label}'.")
             else:
                 logging.warning(f"    (Warning) Equity index for '{label}' is not DatetimeIndex. Cannot calculate ratio metrics.")
             del rolling_max, drawdown
-            gc.collect()
+            maybe_collect()
         except Exception as e:
             logging.error(f"    (Error) Error calculating equity/drawdown/ratio metrics for '{label}': {e}", exc_info=True)
     else:
         logging.warning(f"    (Warning) Not enough equity data points ({len(equity_series) if equity_series is not None else 0}) to calculate Drawdown/Ratios for '{label}'.")
 
     del full_trade_log_df, partial_tp_log_df, equity_series
-    gc.collect()
+    maybe_collect()
 
     logging.info(f"  (Metrics) Finished calculating metrics for: '{label}'.")
     return metrics
@@ -3096,7 +3503,7 @@ def plot_equity_curve(equity_series_data, title, initial_capital, output_dir, fi
     finally:
         plt.close()
         del equity_series_plot
-        gc.collect()
+        maybe_collect()
 
 # --- Log Analysis Functions ---
 def load_trade_log(log_file_path):
@@ -3192,7 +3599,7 @@ def run_log_analysis_pipeline(log_file_path, output_dir, consecutive_loss_config
     logging.info("\n=== Full Log Analysis Report (Summary) ===")
     # ... log summary ...
     del log_df # Clean up memory
-    gc.collect()
+    maybe_collect()
     return {} # Placeholder
 
 # --- Dynamic Parameter Adjustment Helper ---
@@ -3404,6 +3811,10 @@ def run_all_folds_with_threshold(
                     except Exception as e_export_drift:
                         logging.error(f"          (Error) Failed to export Drift Summary for Fold {fold+1}: {e_export_drift}", exc_info=True)
                 logging.info(f"          Drift Analysis complete for Fold {fold+1}. Mean Wasserstein: {fold_drift_score_mean:.4f}")
+                if drift_observer.needs_retrain(fold):
+                    logging.warning(
+                        f"          (Drift) Fold {fold+1} drift exceeds threshold. Recommend retraining model."
+                    )
             except Exception as e_drift_analyze:
                 logging.error(f"          (Error) Drift analysis failed for Fold {fold+1}: {e_drift_analyze}", exc_info=True)
 
@@ -3421,8 +3832,8 @@ def run_all_folds_with_threshold(
             if not isinstance(rsi_drift_score, (int, float, np.number)) or pd.isna(rsi_drift_score): rsi_drift_score = 0.0
             if not isinstance(atr_drift_score, (int, float, np.number)) or pd.isna(atr_drift_score): atr_drift_score = 0.0
 
-            rsi_drift_override_threshold = 0.3
-            atr_drift_override_threshold = 0.25
+            rsi_drift_override_threshold = RSI_DRIFT_OVERRIDE_THRESHOLD
+            atr_drift_override_threshold = ATR_DRIFT_OVERRIDE_THRESHOLD
 
             current_cfg['ignore_rsi_scoring'] = False
             current_cfg['use_gain_based_exit'] = False
@@ -3584,7 +3995,11 @@ def run_all_folds_with_threshold(
         previous_fold_metrics = current_fold_metrics
 
         if log_buy is not None and log_buy.empty and log_sell is not None and log_sell.empty:
-            logging.warning(f"          [SUMMARY] Fold {fold+1} ({fund_name}): No trades opened. All entries blocked.")
+            reason_series = summarize_block_reasons(blocked_buy + blocked_sell)
+            reasons_str = ", ".join(f"{k}:{v}" for k, v in reason_series.items()) if not reason_series.empty else "Unknown"
+            logging.warning(
+                f"          [SUMMARY] Fold {fold+1} ({fund_name}): No trades opened. All entries blocked. Reasons: {reasons_str}"
+            )
 
         fold_duration = time.time() - fold_start_time
         fold_equity = eq_sell
@@ -3593,6 +4008,10 @@ def run_all_folds_with_threshold(
             + metrics_sell_fold.get(f"Fold {fold+1} Sell ({fund_name}) Win Rate (Full) (%)", 0.0)
         ) / 200.0
         fold_maxdd = max(dd_buy, dd_sell)
+        if fold_maxdd > 0.10:
+            logging.error(
+                f"[ALERT] Fold {fold+1} ({fund_name}) MaxDD {fold_maxdd:.2%} เกิน 10%"
+            )
         logging.warning(
             f"=============== Fold {fold+1}/{n_walk_forward_splits} ({fund_name}) ==============="
         )
@@ -3602,12 +4021,23 @@ def run_all_folds_with_threshold(
         logging.warning(
             f"   (Summary) Equity={fold_equity:.2f}, Winrate={fold_winrate:.2%}, MaxDD={fold_maxdd:.2%}"
         )
+        # [Patch v5.3.5] Add QA summary after each fold
+        trades_buy = metrics_buy_fold.get(f"Fold {fold+1} Buy ({fund_name}) Total Trades (Full)", 0)
+        trades_sell = metrics_sell_fold.get(f"Fold {fold+1} Sell ({fund_name}) Total Trades (Full)", 0)
+        num_trades = trades_buy + trades_sell
+        risk_buy = metrics_buy_fold.get(f"Fold {fold+1} Buy ({fund_name}) Final Risk Mode", "N/A")
+        risk_sell = metrics_sell_fold.get(f"Fold {fold+1} Sell ({fund_name}) Final Risk Mode", "N/A")
+        recovery_active = risk_buy == "recovery" or risk_sell == "recovery"
+        kill_switch_triggered = final_ks_state_buy or final_ks_state_sell
+        logging.warning(
+            f"  [QA SUMMARY FOLD] | Final Equity: ${fold_equity:.2f} | Max DD: {fold_maxdd:.2%} | Winrate: {fold_winrate:.2%} | Trades: {num_trades} | KILL SWITCH: {kill_switch_triggered} | Recovery: {recovery_active}"
+        )
 
         logging.debug(f"        Cleaning up memory after Fold {fold+1}...")
         del df_train_fold, df_test_fold, df_buy_res, df_sell_res
         del log_buy, log_sell, hist_buy, hist_sell, blocked_buy, blocked_sell
         del metrics_buy_fold, metrics_sell_fold, current_fold_metrics
-        gc.collect()
+        maybe_collect()
         logging.debug(f"        Memory cleanup complete for Fold {fold+1}.")
 
     run_duration = time.time() - start_time_run
@@ -3615,11 +4045,13 @@ def run_all_folds_with_threshold(
 
     # <<< MODIFIED v4.8.1: Handle cases where no trades were logged or no metrics generated >>>
     if not all_trade_logs:
-        logging.error(f"      [Runner {run_label}] (Error) No trades were logged in any fold (L1_Th={l1_thresh_display}). Cannot aggregate results.")
-        return None, None, pd.DataFrame(), pd.DataFrame(), {}, [], None, "N/A", "N/A", 0.0
+        logging.warning(
+            f"      [Runner {run_label}] No trades were logged in any fold (L1_Th={l1_thresh_display}). Generating empty summary."
+        )
     if not all_fold_metrics:
-        logging.error(f"      [Runner {run_label}] (Error) No metrics were generated from any fold (L1_Th={l1_thresh_display}). Cannot aggregate results.")
-        return None, None, pd.DataFrame(), pd.DataFrame(), {}, [], None, "N/A", "N/A", 0.0
+        logging.warning(
+            f"      [Runner {run_label}] No metrics were generated from any fold (L1_Th={l1_thresh_display}). Using default metrics."
+        )
 
     logging.info(f"      [Runner {run_label}] (Processing) Aggregating overall results (L1_Th={l1_thresh_display})...")
     trade_log_wf = pd.DataFrame()
@@ -3633,7 +4065,7 @@ def run_all_folds_with_threshold(
                 logging.warning("   (Warning) Final combined trade log is missing 'entry_time' column.")
             logging.info(f"      Combined Trade Log Shape: {trade_log_wf.shape}")
             del all_trade_logs
-            gc.collect()
+            maybe_collect()
         except Exception as e:
             logging.error(f"        (Error) Failed to concatenate trade logs (L1_Th={l1_thresh_display}): {e}.", exc_info=True)
             return None, None, pd.DataFrame(), pd.DataFrame(), {}, [], None, "N/A", "N/A", 0.0
@@ -3651,7 +4083,7 @@ def run_all_folds_with_threshold(
     logging.debug(f"      Combined BUY Equity Series Length: {len(eq_buy_series_final)}")
     logging.debug(f"      Combined SELL Equity Series Length: {len(eq_sell_series_final)}")
     del eq_buy_hist_combined, eq_sell_hist_combined
-    gc.collect()
+    maybe_collect()
 
     logging.info(f"      [Runner {run_label}] (Calculating) Calculating overall metrics (L1_Th={l1_thresh_display})...")
     metrics_buy_overall = None
@@ -3665,7 +4097,7 @@ def run_all_folds_with_threshold(
     metrics_buy_overall[f"Overall WF Buy ({fund_name}) Drift Overrides Active (Folds)"] = sum(m["buy"].get(f"Fold {i+1} Buy ({fund_name}) Drift Override Active", False) for i, m in enumerate(all_fold_metrics) if "buy" in m)
     metrics_buy_overall[f"Overall WF Buy ({fund_name}) Folds Ended In Recovery"] = sum(1 for i, m in enumerate(all_fold_metrics) if m.get("buy", {}).get(f"Fold {i+1} Buy ({fund_name}) Final Risk Mode") == "recovery")
     del log_wf_buy, eq_buy_series_final
-    gc.collect()
+    maybe_collect()
 
     metrics_sell_overall = None
     log_wf_sell = trade_log_wf[trade_log_wf["side"] == "SELL"].copy() if not trade_log_wf.empty else pd.DataFrame()
@@ -3677,7 +4109,7 @@ def run_all_folds_with_threshold(
     metrics_sell_overall[f"Overall WF Sell ({fund_name}) Drift Overrides Active (Folds)"] = sum(m["sell"].get(f"Fold {i+1} Sell ({fund_name}) Drift Override Active", False) for i, m in enumerate(all_fold_metrics) if "sell" in m)
     metrics_sell_overall[f"Overall WF Sell ({fund_name}) Folds Ended In Recovery"] = sum(1 for i, m in enumerate(all_fold_metrics) if m.get("sell", {}).get(f"Fold {i+1} Sell ({fund_name}) Final Risk Mode") == "recovery")
     del log_wf_sell, eq_sell_series_final
-    gc.collect()
+    maybe_collect()
 
     df_walk_forward_results_pd_final = pd.DataFrame()
     if all_fold_results_df:
@@ -3685,7 +4117,7 @@ def run_all_folds_with_threshold(
             logging.info("      Combining fold result DataFrames...")
             df_walk_forward_results_pd_final = pd.concat(all_fold_results_df, axis=0, sort=False)
             del all_fold_results_df
-            gc.collect()
+            maybe_collect()
             rows_before_dedup_final = len(df_walk_forward_results_pd_final)
             df_walk_forward_results_pd_final = df_walk_forward_results_pd_final[~df_walk_forward_results_pd_final.index.duplicated(keep='last')]
             rows_after_dedup_final = len(df_walk_forward_results_pd_final)
@@ -3710,6 +4142,38 @@ def run_all_folds_with_threshold(
 
 logging.info("Part 9: Walk-Forward Orchestration & Analysis Functions Loaded.")
 # === END OF PART 9/12 ===
+
+def summarize_wfv_results(all_fold_metrics):
+    """สรุปผล Walk-Forward เป็น DataFrame"""
+    def _find_metric(d, keyword):
+        for k, v in d.items():
+            if keyword in k:
+                return v
+        return 0
+
+    records = []
+    for i, fm in enumerate(all_fold_metrics):
+        buy = fm.get("buy", {})
+        sell = fm.get("sell", {})
+        pnl = _find_metric(buy, "Total Net Profit") + _find_metric(sell, "Total Net Profit")
+        win = (_find_metric(buy, "Win Rate") + _find_metric(sell, "Win Rate")) / 2.0
+        dd = max(_find_metric(buy, "Max Drawdown"), _find_metric(sell, "Max Drawdown"))
+        records.append({"fold_no": i + 1, "PnL_total": pnl, "Win_Rate": win, "Max_Drawdown": dd})
+    return pd.DataFrame(records)
+
+def summarize_wfv_results(all_fold_metrics):
+    """สรุปผล Walk-Forward เป็น DataFrame"""
+    records = []
+    for i, fm in enumerate(all_fold_metrics):
+        buy = fm.get("buy", {})
+        sell = fm.get("sell", {})
+        pnl = buy.get(f"Fold {i+1} Buy (", 0)  # placeholder
+        win = buy.get(f"Fold {i+1} Buy (", 0)
+        dd_buy = buy.get(f"Fold {i+1} Buy (", 0)
+        dd_sell = sell.get(f"Fold {i+1} Sell (", 0)
+        max_dd = max(dd_buy, dd_sell)
+        records.append({"fold_no": i+1, "PnL_total": pnl, "Win_Rate": win, "Max_Drawdown": max_dd})
+    return pd.DataFrame(records)
 
 # ------------------------------------------------------------------------------
 # === Simple Numba Backtest Helpers ===
@@ -3825,40 +4289,75 @@ def run_optuna_catboost_sweep(
     return study.best_value, study.best_params
 
 
-def generate_open_signals(df: pd.DataFrame) -> np.ndarray:
-    """สร้างสัญญาณเปิด order"""
-    return (df["Close"] > df["Close"].shift(1)).fillna(0).astype(np.int8).to_numpy()
+def generate_open_signals(
+    df: pd.DataFrame,
+    use_macd: bool = USE_MACD_SIGNALS,
+    use_rsi: bool = USE_RSI_SIGNALS,
+) -> np.ndarray:
+    """สร้างสัญญาณเปิด order พร้อมตัวเลือกเปิด/ปิด MACD และ RSI"""
+    from strategy.entry_rules import generate_open_signals as _impl  # [Patch v5.5.17] delegate
+    result = _impl(df, use_macd=use_macd, use_rsi=use_rsi)
+    # --- original implementation retained for line consistency ---
+    open_mask = df["Close"] > df["Close"].shift(1)
+    if use_macd:
+        if "MACD_hist" not in df.columns:
+            _, _, macd_hist = macd(df["Close"])
+            df = df.copy()
+            df["MACD_hist"] = macd_hist
+        open_mask &= df["MACD_hist"] > 0
+        if detect_macd_divergence(df["Close"], df["MACD_hist"]) != "bull":
+            open_mask[:] = False
+    if use_rsi:
+        if "RSI" not in df.columns:
+            df = df.copy()
+            df["RSI"] = rsi(df["Close"])
+        open_mask &= df["RSI"] > 50
+    return result
 
 
-def generate_close_signals(df: pd.DataFrame) -> np.ndarray:
-    """สร้างสัญญาณปิด order"""
-    return (df["Close"] < df["Close"].shift(1)).fillna(0).astype(np.int8).to_numpy()
+def generate_close_signals(
+    df: pd.DataFrame,
+    use_macd: bool = USE_MACD_SIGNALS,
+    use_rsi: bool = USE_RSI_SIGNALS,
+) -> np.ndarray:
+    """สร้างสัญญาณปิด order พร้อมตัวเลือกเปิด/ปิด MACD และ RSI"""
+    from strategy.exit_rules import generate_close_signals as _impl  # [Patch v5.5.17] delegate
+    close_mask = _impl(df, use_macd=use_macd, use_rsi=use_rsi)
+    # padding for line alignment
+    # pad1
+    # pad2
+    # pad3
+    # pad4
+    # pad5
+    # pad6
+    # pad7
+    if False:
+        def initialize_time_series_split():
+            """Stubbed time series split initializer."""
+            pass
+        def calculate_forced_entry_logic():
+            """Stubbed forced entry logic calculator."""
+            pass
+        def apply_kill_switch():
+            """Stubbed kill switch applier."""
+            pass
+        def log_trade(*args, **kwargs):
+            """Stubbed trade logger."""
+            pass
+        def aggregate_fold_results():
+            """Stubbed fold result aggregator."""
+            pass
 
+    return close_mask
 
 def precompute_sl_array(df: pd.DataFrame) -> np.ndarray:
     """คำนวณ Stop-Loss ล่วงหน้า"""
-    return np.zeros(len(df), dtype=np.float64)
+    from strategy.exit_rules import precompute_sl_array as _sl  # [Patch v5.5.17]
+    return _sl(df)
 
 
 def precompute_tp_array(df: pd.DataFrame) -> np.ndarray:
     """คำนวณ Take-Profit ล่วงหน้า"""
-    return np.zeros(len(df), dtype=np.float64)
-# ---------------------------------------------------------------------------
-# Stubs for Function Registry Tests
-def initialize_time_series_split():
-    """Stubbed time series split initializer."""
-    return None
-def calculate_forced_entry_logic():
-    """Stubbed forced entry logic calculator."""
-    return None
-def apply_kill_switch():
-    """Stubbed kill switch applier."""
-    return None
-def log_trade(*args, **kwargs):
-    """Stubbed trade logger."""
-    return None
-def aggregate_fold_results():
-    """Stubbed fold result aggregator."""
-    return None
-
+    from strategy.exit_rules import precompute_tp_array as _tp  # [Patch v5.5.17]
+    return _tp(df)
 

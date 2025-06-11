@@ -18,11 +18,15 @@ import ta # Assumes 'ta' is imported and available (checked in Part 1)
 from sklearn.cluster import KMeans # For context column calculation
 from sklearn.preprocessing import StandardScaler # For context column calculation
 import gc # For memory management
+from src.utils.gc_utils import maybe_collect
+from functools import lru_cache
 from src.utils.sessions import get_session_tag  # [Patch v5.1.3]
+from src.utils import get_env_float
 
 _rsi_cache = {}  # [Patch v4.8.12] Cache RSIIndicator per period
 _atr_cache = {}  # [Patch v4.8.12] Cache AverageTrueRange per period
 _sma_cache = {}  # [Patch v4.8.12] Cache SMA results
+_m15_trend_cache = {}
 
 # Ensure global configurations are accessible if run independently
 DEFAULT_ROLLING_Z_WINDOW_M1 = 300; DEFAULT_ATR_ROLLING_AVG_PERIOD = 50
@@ -30,8 +34,8 @@ DEFAULT_PATTERN_BREAKOUT_Z_THRESH = 2.0; DEFAULT_PATTERN_REVERSAL_BODY_RATIO = 0
 DEFAULT_PATTERN_STRONG_TREND_Z_THRESH = 1.0; DEFAULT_PATTERN_CHOPPY_CANDLE_RATIO = 0.3
 DEFAULT_PATTERN_CHOPPY_WICK_RATIO = 0.6; DEFAULT_M15_TREND_EMA_FAST = 50
 DEFAULT_M15_TREND_EMA_SLOW = 200; DEFAULT_M15_TREND_RSI_PERIOD = 14
-DEFAULT_M15_TREND_RSI_UP = 52; DEFAULT_M15_TREND_RSI_DOWN = 48
-DEFAULT_TIMEFRAME_MINUTES_M1 = 1; DEFAULT_MIN_SIGNAL_SCORE_ENTRY = 2.0
+DEFAULT_M15_TREND_RSI_UP = 51; DEFAULT_M15_TREND_RSI_DOWN = 49  # [Patch v5.6.4]
+DEFAULT_TIMEFRAME_MINUTES_M1 = 1; DEFAULT_MIN_SIGNAL_SCORE_ENTRY = 1.0  # [Patch v5.3.9]
 DEFAULT_ADAPTIVE_TSL_HIGH_VOL_RATIO = 1.8; DEFAULT_ADAPTIVE_TSL_LOW_VOL_RATIO = 0.75
 DEFAULT_ADAPTIVE_TSL_DEFAULT_STEP_R = 0.5; DEFAULT_ADAPTIVE_TSL_HIGH_VOL_STEP_R = 1.0
 DEFAULT_ADAPTIVE_TSL_LOW_VOL_STEP_R = 0.3; DEFAULT_ADAPTIVE_TSL_START_ATR_MULT = 1.5
@@ -79,36 +83,41 @@ except NameError: ADAPTIVE_TSL_START_ATR_MULT = DEFAULT_ADAPTIVE_TSL_START_ATR_M
 try: META_CLASSIFIER_FEATURES
 except NameError: META_CLASSIFIER_FEATURES = []
 try: SESSION_TIMES_UTC
-except NameError: SESSION_TIMES_UTC = {"Asia": (0, 8), "London": (7, 16), "NY": (13, 21)}
+except NameError: SESSION_TIMES_UTC = {"Asia": (22, 8), "London": (7, 16), "NY": (13, 21)}
 
 
 # --- Indicator Calculation Functions ---
 def ema(series, period):
     if not isinstance(series, pd.Series): logging.error(f"EMA Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
-    if series.empty: logging.debug("EMA: Input series is empty, returning empty series."); return pd.Series(dtype='float32')
+    if series.empty:
+        logging.debug("EMA: Input series is empty, returning NaN-aligned series.")
+        return pd.Series(np.nan, index=series.index, dtype='float32')
     series_numeric = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
     if series_numeric.empty: logging.warning("EMA: Series contains only NaN/Inf values or is empty after cleaning."); return pd.Series(np.nan, index=series.index, dtype='float32')
     try:
         ema_calculated = series_numeric.ewm(span=period, adjust=False, min_periods=max(1, period)).mean()
-        ema_result = ema_calculated.reindex(series.index); del series_numeric, ema_calculated; gc.collect()
+        ema_result = ema_calculated.reindex(series.index); del series_numeric, ema_calculated; maybe_collect()
         return ema_result.astype('float32')
     except Exception as e: logging.error(f"EMA calculation failed for period {period}: {e}", exc_info=True); return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
 
 def sma(series, period):
     if not isinstance(series, pd.Series): logging.error(f"SMA Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
-    if series.empty: logging.debug("SMA: Input series is empty, returning empty series."); return pd.Series(dtype='float32')
+    if series.empty:
+        logging.debug("SMA: Input series is empty, returning NaN-aligned series.")
+        return pd.Series(np.nan, index=series.index, dtype='float32')
     if not isinstance(period, int) or period <= 0: logging.error(f"SMA calculation failed: Invalid period ({period})."); return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
     series_numeric = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0)
     if series_numeric.isnull().all(): logging.warning("SMA: Series contains only NaN values after numeric conversion and fill."); return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
     try:
         cache_key = (id(series), period)
         if cache_key in _sma_cache:
-            return _sma_cache[cache_key]
+            cached = _sma_cache[cache_key]
+            return cached.reindex(series.index).astype('float32')
         min_p = max(1, min(period, len(series_numeric)))
         sma_result = series_numeric.rolling(window=period, min_periods=min_p).mean()
         sma_final = sma_result.reindex(series.index).astype('float32')
         _sma_cache[cache_key] = sma_final
-        del series_numeric, sma_result; gc.collect()
+        del series_numeric, sma_result; maybe_collect()
         return sma_final
     except Exception as e:
         logging.error(f"SMA calculation failed for period {period}: {e}", exc_info=True)
@@ -117,7 +126,9 @@ def sma(series, period):
 def rsi(series, period=14):
     if not isinstance(series, pd.Series): logging.error(f"RSI Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
     # [Patch v4.8.12] Use module-level cache for RSIIndicator
-    if series.empty: logging.debug("RSI: Input series is empty, returning empty series."); return pd.Series(dtype='float32')
+    if series.empty:
+        logging.debug("RSI: Input series is empty, returning NaN-aligned series.")
+        return pd.Series(np.nan, index=series.index, dtype='float32')
     if 'ta' not in globals() or ta is None: logging.error("   (Error) RSI calculation failed: 'ta' library not loaded."); return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
     # Convert to numeric and drop NaN/inf values
     series_numeric = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
@@ -126,9 +137,9 @@ def rsi(series, period=14):
             f"   (Warning) RSI calculation skipped: Not enough valid data points ({len(series_numeric)} < {period})."
         )
         return pd.Series(np.nan, index=series.index, dtype='float32')
-    # [Patch v5.1.10] Drop duplicate timestamps to avoid reindex errors
+    # [Patch v5.5.16] Consolidate duplicate timestamps using last occurrence
     if series_numeric.index.duplicated().any():
-        series_numeric = series_numeric[~series_numeric.index.duplicated(keep='first')]
+        series_numeric = series_numeric.groupby(series_numeric.index).last()
     try:
         cache_key = period
         if cache_key not in _rsi_cache:
@@ -139,7 +150,7 @@ def rsi(series, period=14):
         # Reindex to original index with forward-fill
         rsi_final = rsi_series.reindex(series.index, method='ffill').astype('float32')
         del series_numeric, rsi_series
-        gc.collect()
+        maybe_collect()
         return rsi_final
     except Exception as e:
         logging.error(f"   (Error) RSI calculation error for period {period}: {e}.", exc_info=True)
@@ -189,10 +200,24 @@ def atr(df_in, period=14):
             logging.error(f"   (Error) Pandas EWM ATR calculation failed: {e_pd_atr}", exc_info=True)  # pragma: no cover
             df_result = df_in.copy(); df_result[atr_col_name] = np.nan; df_result[atr_shifted_col_name] = np.nan
             df_result[atr_col_name] = df_result[atr_col_name].astype('float32'); df_result[atr_shifted_col_name] = df_result[atr_shifted_col_name].astype('float32')
-            del df_temp; gc.collect(); return df_result
+            del df_temp; maybe_collect(); return df_result
     df_result = df_in.copy(); df_result[atr_col_name] = atr_series.reindex(df_in.index).astype('float32')
     df_result[atr_shifted_col_name] = atr_series.shift(1).reindex(df_in.index).astype('float32')
-    del df_temp, atr_series; gc.collect(); return df_result
+    del df_temp, atr_series; maybe_collect(); return df_result
+
+
+@lru_cache(maxsize=None)
+def calculate_sma(symbol: str, timeframe: str, length: int, date: str, prices: tuple):
+    """Cached SMA calculation using LRU cache."""
+    series = pd.Series(prices, dtype='float32')
+    return sma(series, length)
+
+
+@lru_cache(maxsize=None)
+def calculate_rsi(symbol: str, timeframe: str, length: int, date: str, prices: tuple):
+    """Cached RSI calculation using LRU cache."""
+    series = pd.Series(prices, dtype='float32')
+    return rsi(series, period=length)
 
 def macd(series, window_slow=26, window_fast=12, window_sign=9):
     if not isinstance(series, pd.Series): logging.error(f"MACD Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
@@ -207,13 +232,64 @@ def macd(series, window_slow=26, window_fast=12, window_sign=9):
         macd_line_final = macd_indicator.macd().reindex(series.index).ffill().astype('float32')
         macd_signal_final = macd_indicator.macd_signal().reindex(series.index).ffill().astype('float32')
         macd_diff_final = macd_indicator.macd_diff().reindex(series.index).ffill().astype('float32')
-        del series_numeric, macd_indicator; gc.collect()
+        del series_numeric, macd_indicator; maybe_collect()
         return (macd_line_final, macd_signal_final, macd_diff_final)
     except Exception as e: logging.error(f"   (Error) MACD calculation error: {e}.", exc_info=True); return nan_series_indexed, nan_series_indexed.copy(), nan_series_indexed.copy()
 
+def detect_macd_divergence(prices: pd.Series, macd_hist: pd.Series, lookback: int = 20) -> str:
+    """ตรวจจับภาวะ Divergence อย่างง่ายระหว่างราคากับ MACD histogram
+
+    Parameters
+    ----------
+    prices : pd.Series
+        ราคาปิด
+    macd_hist : pd.Series
+        ค่า MACD histogram
+    lookback : int, optional
+        จำนวนแท่งย้อนหลังที่ใช้พิจารณา, ค่าเริ่มต้น 20
+
+    Returns
+    -------
+    str
+        "bull" หากพบ Bullish Divergence, "bear" หากพบ Bearish Divergence, ไม่เช่นนั้นคืน "none"
+    """
+
+    if not isinstance(prices, pd.Series) or not isinstance(macd_hist, pd.Series):
+        logging.error("detect_macd_divergence: inputs must be pandas Series")
+        raise TypeError("Inputs must be pandas Series")
+
+    if prices.empty or macd_hist.empty:
+        return "none"
+
+    p = pd.to_numeric(prices, errors="coerce").ffill().bfill()
+    m = pd.to_numeric(macd_hist, errors="coerce").ffill().bfill()
+
+    look = max(3, min(len(p), lookback))
+    p_sub = p.iloc[-look:]
+    m_sub = m.reindex(p_sub.index)
+
+    lows = p_sub[(p_sub.shift(1) > p_sub) & (p_sub.shift(-1) > p_sub)]
+    highs = p_sub[(p_sub.shift(1) < p_sub) & (p_sub.shift(-1) < p_sub)]
+
+    if len(lows) >= 2:
+        pl1, pl2 = lows.iloc[-2], lows.iloc[-1]
+        ml1, ml2 = m_sub.loc[lows.index[-2]], m_sub.loc[lows.index[-1]]
+        if pl2 < pl1 and ml2 > ml1:
+            return "bull"
+
+    if len(highs) >= 2:
+        ph1, ph2 = highs.iloc[-2], highs.iloc[-1]
+        mh1, mh2 = m_sub.loc[highs.index[-2]], m_sub.loc[highs.index[-1]]
+        if ph2 > ph1 and mh2 < mh1:
+            return "bear"
+
+    return "none"
+
 def rolling_zscore(series, window, min_periods=None):
     if not isinstance(series, pd.Series): logging.error(f"Rolling Z-Score Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
-    if series.empty: logging.debug("Rolling Z-Score: Input series empty, returning empty series."); return pd.Series(dtype='float32')
+    if series.empty:
+        logging.debug("Rolling Z-Score: Input series empty, returning NaN-aligned series.")
+        return pd.Series(np.nan, index=series.index, dtype='float32')
     if len(series) < 2: logging.debug("Rolling Z-Score: Input series too short (< 2), returning zeros."); return pd.Series(0.0, index=series.index, dtype='float32')
     series_numeric = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0)
     if series_numeric.isnull().all(): logging.warning("Rolling Z-Score: Series contains only NaN values after numeric conversion and fill, returning zeros."); return pd.Series(0.0, index=series.index, dtype='float32')
@@ -228,7 +304,7 @@ def rolling_zscore(series, window, min_periods=None):
         z_filled = z.fillna(0.0);
         if np.isinf(z_filled).any(): z_filled.replace([np.inf, -np.inf], 0.0, inplace=True)
         z_final = z_filled.reindex(series.index).fillna(0.0)
-        del series_numeric, rolling_mean, rolling_std, rolling_std_safe, z, z_filled; gc.collect()
+        del series_numeric, rolling_mean, rolling_std, rolling_std_safe, z, z_filled; maybe_collect()
         return z_final.astype('float32')
     except Exception as e: logging.error(f"Rolling Z-Score calculation failed for window {window}: {e}", exc_info=True); return pd.Series(0.0, index=series.index, dtype='float32')
 
@@ -259,32 +335,93 @@ def tag_price_structure_patterns(df):
     df_patterns.loc[choppy_cond & (df_patterns["Pattern_Label"] == "Normal"), "Pattern_Label"] = "Choppy"
     logging.info(f"      Pattern Label Distribution:\n{df_patterns['Pattern_Label'].value_counts(normalize=True).round(3).to_string()}")
     df["Pattern_Label"] = df_patterns["Pattern_Label"].astype('category')
-    del df_patterns, prev_high, prev_low, prev_gain, prev_body, prev_macd_hist, breakout_cond, reversal_cond, inside_bar_cond, strong_trend_cond, choppy_cond; gc.collect()
+    del df_patterns, prev_high, prev_low, prev_gain, prev_body, prev_macd_hist, breakout_cond, reversal_cond, inside_bar_cond, strong_trend_cond, choppy_cond; maybe_collect()
     return df
 
 def calculate_m15_trend_zone(df_m15):
     logging.info("(Processing) กำลังคำนวณ M15 Trend Zone...")
+    cache_key = hash(tuple(df_m15.index)) if isinstance(df_m15, pd.DataFrame) else None
+    if cache_key is not None and cache_key in _m15_trend_cache:
+        logging.info("      [Cache] ใช้ผลลัพธ์ Trend Zone จาก cache")
+        cached_df = _m15_trend_cache[cache_key]
+        return cached_df.reindex(df_m15.index).copy()
     if not isinstance(df_m15, pd.DataFrame): logging.error("M15 Trend Zone Error: Input must be a pandas DataFrame."); raise TypeError("Input must be a pandas DataFrame.")
     if df_m15.empty or "Close" not in df_m15.columns:
-        result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category'); return result_df
+        result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category');
+        if cache_key is not None:
+            _m15_trend_cache[cache_key] = result_df
+        return result_df
     df = df_m15.copy()
     try:
         df["Close"] = pd.to_numeric(df["Close"], errors='coerce')
-        if df["Close"].isnull().all(): result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category'); return result_df
+        if df["Close"].isnull().all():
+            result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category');
+            if cache_key is not None:
+                _m15_trend_cache[cache_key] = result_df
+            return result_df
         df["EMA_Fast"] = ema(df["Close"], M15_TREND_EMA_FAST); df["EMA_Slow"] = ema(df["Close"], M15_TREND_EMA_SLOW); df["RSI"] = rsi(df["Close"], M15_TREND_RSI_PERIOD)
         df.dropna(subset=["EMA_Fast", "EMA_Slow", "RSI"], inplace=True)
-        if df.empty: result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category'); return result_df
+        if df.empty:
+            result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category');
+            if cache_key is not None:
+                _m15_trend_cache[cache_key] = result_df
+            return result_df
         is_up = (df["EMA_Fast"] > df["EMA_Slow"]) & (df["RSI"] > M15_TREND_RSI_UP); is_down = (df["EMA_Fast"] < df["EMA_Slow"]) & (df["RSI"] < M15_TREND_RSI_DOWN)
         df["Trend_Zone"] = "NEUTRAL"; df.loc[is_up, "Trend_Zone"] = "UP"; df.loc[is_down, "Trend_Zone"] = "DOWN"
         if not df.empty: logging.info(f"   การกระจาย M15 Trend Zone:\n{df['Trend_Zone'].value_counts(normalize=True).round(3).to_string()}")
         result_df = df[["Trend_Zone"]].reindex(df_m15.index).fillna("NEUTRAL"); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category')
-        del df, is_up, is_down; gc.collect(); return result_df
+        del df, is_up, is_down; maybe_collect();
+        if cache_key is not None:
+            _m15_trend_cache[cache_key] = result_df
+        return result_df
     except Exception as e:
         logging.error(f"(Error) การคำนวณ M15 Trend Zone ล้มเหลว: {e}", exc_info=True)
-        result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category'); return result_df
+        result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category');
+        if cache_key is not None:
+            _m15_trend_cache[cache_key] = result_df
+        return result_df
+
+# [Patch v5.5.6] Helper to evaluate higher timeframe trend using SMA crossover
+def get_mtf_sma_trend(df_m15, fast=50, slow=200, rsi_period=14, rsi_upper=70, rsi_lower=30):
+    """Return trend direction ('UP', 'DOWN', 'NEUTRAL') for M15 data.
+
+    Parameters
+    ----------
+    df_m15 : pandas.DataFrame
+        M15 OHLC data with at least a 'Close' column.
+    fast : int, optional
+        Fast SMA period. Default 50.
+    slow : int, optional
+        Slow SMA period. Default 200.
+    rsi_period : int, optional
+        RSI period. Default 14.
+    rsi_upper : float, optional
+        Upper RSI filter for uptrend. Default 70.
+    rsi_lower : float, optional
+        Lower RSI filter for downtrend. Default 30.
+    """
+    if not isinstance(df_m15, pd.DataFrame) or df_m15.empty or "Close" not in df_m15.columns:
+        return "NEUTRAL"
+    close = pd.to_numeric(df_m15["Close"], errors="coerce")
+    fast_ma = sma(close, fast)
+    slow_ma = sma(close, slow)
+    rsi_series = rsi(close, period=rsi_period)
+    if fast_ma.empty or slow_ma.empty or rsi_series.empty:
+        return "NEUTRAL"
+    last_fast = fast_ma.iloc[-1]
+    last_slow = slow_ma.iloc[-1]
+    last_rsi = rsi_series.iloc[-1]
+    if pd.isna(last_fast) or pd.isna(last_slow) or pd.isna(last_rsi):
+        return "NEUTRAL"
+    if last_fast > last_slow and last_rsi < rsi_upper:
+        return "UP"
+    if last_fast < last_slow and last_rsi > rsi_lower:
+        return "DOWN"
+    return "NEUTRAL"
 
 # [Patch v5.0.2] Exclude heavy engineering logic from coverage
 def engineer_m1_features(df_m1, timeframe_minutes=TIMEFRAME_MINUTES_M1, lag_features_config=None):  # pragma: no cover
+    logging.info("[QA] Start M1 Feature Engineering")
     logging.info("(Processing) กำลังสร้าง Features M1 (v4.9.0)...") # <<< MODIFIED v4.9.0
     if not isinstance(df_m1, pd.DataFrame): logging.error("Engineer M1 Features Error: Input must be a pandas DataFrame."); raise TypeError("Input must be a pandas DataFrame.")
     if df_m1.empty: logging.warning("   (Warning) ข้ามการสร้าง Features M1: DataFrame ว่างเปล่า."); return df_m1
@@ -355,39 +492,31 @@ def engineer_m1_features(df_m1, timeframe_minutes=TIMEFRAME_MINUTES_M1, lag_feat
             score=(wick_ratio*0.5+gain_z_abs*0.3+atr_val*0.2); score=np.where((atr_val>1.5)&(wick_ratio>0.6),score*1.2,score); df['spike_score']=score.clip(0,1).astype('float32')
         except Exception as e_spike: df['spike_score']=0.0; logging.error(f"         (Error) Spike score calculation failed: {e_spike}.",exc_info=True)
     if 'session' not in df.columns:
-        logging.info("      Creating 'session' column (vectorized)...")
+        logging.info("      Creating 'session' column...")
         try:
-            # ใช้วิธี Vectorized: ดึงชั่วโมงจาก DatetimeIndex แล้วแมปเป็น session
             if not isinstance(df.index, pd.DatetimeIndex):
-                # พยายามแปลง index เป็น DatetimeIndex ครั้งเดียว
                 df.index = pd.to_datetime(df.index, errors='coerce')
-            # ถ้าแปลงแล้วเป็น DatetimeIndex และไม่ว่าง
-            if isinstance(df.index, pd.DatetimeIndex) and not df.index.hasnans:
-                hrs = df.index.hour
-                # สร้างคอลัมน์ session เริ่มต้นเป็น 'Other'
-                df['session'] = 'Other'
-                # Asia: ช่วง 0-7 (UTC)
-                mask_asia = (hrs >= SESSION_TIMES_UTC['Asia'][0]) & (hrs < SESSION_TIMES_UTC['Asia'][1])
-                df.loc[mask_asia, 'session'] = 'Asia'
-                # London: ช่วง 7-15 (UTC)
-                mask_london = (hrs >= SESSION_TIMES_UTC['London'][0]) & (hrs < SESSION_TIMES_UTC['London'][1])
-                df.loc[mask_london, 'session'] = df.loc[mask_london, 'session'].apply(lambda x: 'Asia/London' if x=='Asia' else 'London')
-                # NY: ช่วง 13-20 (UTC)
-                mask_ny = (hrs >= SESSION_TIMES_UTC['NY'][0]) & (hrs < SESSION_TIMES_UTC['NY'][1])
-                df.loc[mask_ny, 'session'] = df.loc[mask_ny, 'session'].apply(lambda x: '/'.join(sorted([x, 'NY'])) if x in ['Asia','London','Asia/London'] else 'NY')
-                # กำหนด dtype category
-                df['session'] = df['session'].astype('category')
-                logging.info(f"         Session distribution:\n{df['session'].value_counts(normalize=True).round(3).to_string()}")
-            else:
-                # กรณีแปลงไม่ได้หรือมี NaT
-                df['session'] = 'Error_Index_Conv'
-                df['session'] = df['session'].astype('category')
+            sessions = pd.Index(df.index).map(lambda ts: get_session_tag(ts, warn_once=True))
+            df['session'] = pd.Series(sessions, index=df.index).astype('category')
+            logging.info(
+                f"         Session distribution:\n{df['session'].value_counts(normalize=True).round(3).to_string()}"
+            )
         except Exception as e_session:
-            logging.error(f"         (Error) Session calculation failed: {e_session}. Assigning 'Other'.", exc_info=True)
-            df['session'] = "Other"
-            df['session'] = df['session'].astype('category')
+            logging.error(
+                f"         (Error) Session calculation failed: {e_session}. Assigning 'Other'.",
+                exc_info=True,
+            )
+            df['session'] = pd.Series('Other', index=df.index).astype('category')
     if 'model_tag' not in df.columns: df['model_tag'] = 'N/A'
-    logging.info("(Success) สร้าง Features M1 (v4.9.0) เสร็จสิ้น.") # <<< MODIFIED v4.9.0
+    logging.info("(Success) สร้าง Features M1 (v4.9.0) เสร็จสิ้น.")  # <<< MODIFIED v4.9.0
+    numeric_cols_clean = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols_clean) > 0:
+        df[numeric_cols_clean] = df[numeric_cols_clean].replace([np.inf, -np.inf], np.nan)
+        df[numeric_cols_clean] = df[numeric_cols_clean].ffill().fillna(0)
+    # [Patch v5.5.4] Run QA check after cleaning to avoid false warnings
+    if df.isnull().any().any() or np.isinf(df[numeric_cols_clean]).any().any():
+        logging.warning("[QA WARNING] NaN/Inf detected in engineered features")
+    logging.info("[QA] M1 Feature Engineering Completed")
     return df.reindex(df_m1.index)
 
 # [Patch v5.0.2] Exclude heavy cleaning logic from coverage
@@ -505,7 +634,7 @@ except ImportError:
 # Ensure global configurations are accessible if run independently
 # Define defaults if globals are not found
 DEFAULT_META_MIN_PROBA_THRESH = 0.5
-DEFAULT_ENABLE_OPTUNA_TUNING = False
+DEFAULT_ENABLE_OPTUNA_TUNING = True
 DEFAULT_OPTUNA_N_TRIALS = 50
 DEFAULT_OPTUNA_CV_SPLITS = 5
 DEFAULT_OPTUNA_METRIC = "AUC"
@@ -556,15 +685,18 @@ try:
     META_MIN_PROBA_THRESH
 except NameError:
     META_MIN_PROBA_THRESH = DEFAULT_META_MIN_PROBA_THRESH
+META_MIN_PROBA_THRESH = get_env_float("META_MIN_PROBA_THRESH", META_MIN_PROBA_THRESH)  # env override
 try:
     REENTRY_MIN_PROBA_THRESH
 except NameError:
     REENTRY_MIN_PROBA_THRESH = META_MIN_PROBA_THRESH
+REENTRY_MIN_PROBA_THRESH = get_env_float("REENTRY_MIN_PROBA_THRESH", REENTRY_MIN_PROBA_THRESH)  # env override
 # <<< [Patch] Added try-except for Meta-Meta threshold >>>
 try:
     META_META_MIN_PROBA_THRESH
 except NameError:
     META_META_MIN_PROBA_THRESH = DEFAULT_META_META_MIN_PROBA_THRESH
+META_META_MIN_PROBA_THRESH = get_env_float("META_META_MIN_PROBA_THRESH", META_META_MIN_PROBA_THRESH)  # env override
 # <<< End of [Patch] >>>
 try:
     ENABLE_OPTUNA_TUNING
@@ -1192,6 +1324,20 @@ logging.info("Part 6: Machine Learning Configuration & Helpers Loaded (v4.8.8 Pa
 # ---------------------------------------------------------------------------
 # Stubs for Function Registry Tests
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def calculate_trend_zone(df):
     """Stubbed trend zone calculator."""
     return pd.Series("NEUTRAL", index=df.index)
@@ -1218,4 +1364,117 @@ def load_feature_config(path):
 def calculate_ml_features(df):
     """Stubbed ML feature calculator."""
     return df
+
+
+# [Patch v5.5.7] Add simple volume spike detector
+def is_volume_spike(current_vol, avg_vol, multiplier=1.5):
+    """Return True if current volume exceeds multiplier * average volume."""
+    try:
+        cur = float(current_vol)
+        avg = float(avg_vol)
+    except Exception:
+        logging.debug("Volume Spike: invalid input values")
+        return False
+    if np.isnan(cur) or np.isnan(avg) or avg <= 0:
+        return False
+    return cur > avg * multiplier
+
+
+# [Patch v5.6.2] HDF5 helpers fallback to pickle when PyTables missing
+def save_features_hdf5(df, path):
+    """Save a DataFrame to an HDF5 file or pickle if PyTables is unavailable."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec("tables") is None:
+            df.to_pickle(path)
+            logging.warning("(Warning) PyTables not installed, saved as pickle")
+            return
+        df.to_hdf(path, key="data", mode="w")
+        logging.info(f"(Features) Saved features to {path}")
+    except Exception as e:
+        logging.error(f"(Features) Failed to save features to {path}: {e}", exc_info=True)
+
+
+def load_features_hdf5(path):
+    """Load a DataFrame from an HDF5 file or pickle as a fallback."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec("tables") is None:
+            df = pd.read_pickle(path)
+            logging.warning("(Warning) PyTables not installed, loaded from pickle")
+            return df
+        df = pd.read_hdf(path, key="data")
+        logging.info(f"(Features) Loaded features from {path}")
+        return df
+    except Exception as e:
+        logging.error(f"(Features) Failed to load features from {path}: {e}", exc_info=True)
+        return None
+
+# --- Advanced Feature Utilities -------------------------------------------------
+# [Patch v5.6.5] Add momentum, cumulative delta, and wave pattern helpers
+
+def add_momentum_features(df, windows=(5, 10, 15, 20)):
+    """Add ROC and RSI momentum features for the given rolling windows."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be DataFrame")
+    if not {'Close', 'Open'}.issubset(df.columns):
+        logging.warning("    (Warning) Missing 'Close' or 'Open' columns for momentum features.")
+        return df
+
+    df_out = df.copy()
+    close = pd.to_numeric(df_out['Close'], errors='coerce')
+    for w in windows:
+        if not isinstance(w, int) or w <= 0:
+            continue
+        roc = close.pct_change(periods=w) * 100
+        df_out[f'ROC_{w}'] = roc.astype('float32')
+        df_out[f'RSI_{w}'] = rsi(close, period=w)
+    return df_out
+
+
+def calculate_cumulative_delta_price(df, window=10):
+    """Return rolling sum of Close-Open over the given window."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be DataFrame")
+    if not {'Close', 'Open'}.issubset(df.columns):
+        logging.warning("    (Warning) Missing 'Close' or 'Open' columns for cumulative delta.")
+        return pd.Series(np.zeros(len(df)), index=df.index, dtype='float32')
+    delta = pd.to_numeric(df['Close'], errors='coerce') - pd.to_numeric(df['Open'], errors='coerce')
+    cum_delta = delta.rolling(window=window, min_periods=1).sum()
+    return cum_delta.astype('float32')
+
+
+def merge_wave_pattern_labels(df, log_path):
+    """Merge Wave_Marker_Unit pattern labels onto df as 'Wave_Pattern'."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be DataFrame")
+    df_out = df.copy()
+    if not os.path.exists(log_path):
+        logging.warning(f"   (Warning) Wave_Marker log not found: {log_path}")
+        df_out['Wave_Pattern'] = 'Unknown'
+        df_out['Wave_Pattern'] = df_out['Wave_Pattern'].astype('category')
+        return df_out
+    try:
+        pattern_df = pd.read_csv(log_path)
+        pattern_df['datetime'] = pd.to_datetime(pattern_df['datetime'], errors='coerce')
+        pattern_df = pattern_df.dropna(subset=['datetime', 'pattern_label']).sort_values('datetime')
+    except Exception as e:
+        logging.error(f"   (Error) Failed to load pattern log: {e}", exc_info=True)
+        df_out['Wave_Pattern'] = 'Unknown'
+        df_out['Wave_Pattern'] = df_out['Wave_Pattern'].astype('category')
+        return df_out
+
+    if not isinstance(df_out.index, pd.DatetimeIndex):
+        df_out.index = pd.to_datetime(df_out.index, errors='coerce')
+
+    merged = pd.merge_asof(
+        df_out.sort_index(),
+        pattern_df.rename(columns={'datetime': 'index'}).sort_values('index'),
+        left_index=True,
+        right_on='index',
+        direction='backward'
+    )
+    df_out['Wave_Pattern'] = merged['pattern_label'].fillna('Unknown').astype('category')
+    return df_out
+
 

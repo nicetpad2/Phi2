@@ -26,7 +26,8 @@ from joblib import load, dump as joblib_dump
 import traceback
 import pandas as pd
 import numpy as np
-AUTO_INSTALL_LIBS = False  # If False, skip auto-installation of libraries
+# [Patch v5.5.1] Enable auto-installation of libraries
+AUTO_INSTALL_LIBS = True  # If False, skip auto-installation of libraries
 # อ่านเวอร์ชันจากไฟล์ VERSION
 VERSION_FILE = os.path.join(os.path.dirname(__file__), '..', 'VERSION')
 with open(VERSION_FILE, 'r', encoding='utf-8') as vf:
@@ -48,17 +49,25 @@ from IPython import get_ipython
 import shutil
 import gzip
 import requests  # For Font Download
+from src.utils import get_env_float
 
 # --- Logging Configuration ---
 # กำหนดค่าพื้นฐานสำหรับการ Logging
 # สามารถปรับ level, format, และ filename ได้ตามต้องการ
-LOG_FILENAME = f'gold_ai_v{__version__}.log'
+LOG_FILENAME = f'gold_ai_v{__version__}_qa.log'
 
 # ตั้งค่า Logger กลางเพื่อให้โมดูลอื่น ๆ ใช้งานร่วมกัน
 logger = logging.getLogger('NiceGold')
-logger.setLevel(logging.WARNING)
+# [Patch v5.5.6] Force COMPACT_LOG when running under pytest
+if os.environ.get('PYTEST_CURRENT_TEST'):
+    os.environ['COMPACT_LOG'] = '1'
+# [Patch v5.4.1] รองรับโหมด COMPACT_LOG เพื่อลดข้อความที่แสดงบนหน้าจอ
+_compact_log = os.environ.get('COMPACT_LOG', '0') == '1'
+_log_level_name = 'WARNING' if _compact_log else os.environ.get('LOG_LEVEL', 'INFO').upper()
+_log_level = getattr(logging, _log_level_name, logging.INFO)
+logger.setLevel(_log_level)
 formatter = logging.Formatter(
-    '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    '[%(asctime)s][%(levelname)s][%(process)d][%(filename)s:%(lineno)d] - %(message)s'
 )
 fh = logging.FileHandler(LOG_FILENAME, mode='w', encoding='utf-8')
 fh.setFormatter(formatter)
@@ -70,15 +79,10 @@ for h in logger.handlers:
 logger.handlers.clear()
 logger.addHandler(fh)
 logger.addHandler(sh)
-logger.propagate = True
+logger.propagate = True  # [Patch v5.3.8] Propagate to root for testing
 atexit.register(logging.shutdown)
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-# [Patch] Preserve any existing handlers (e.g., from test frameworks)
-# rather than clearing them so that external log capture still works.
-for handler in logger.handlers:
-    if handler not in root_logger.handlers:
-        root_logger.addHandler(handler)
+root_logger.setLevel(_log_level)
 logger.info(f"--- (Start) Gold AI v{__version__} ---")
 logger.info("--- กำลังโหลดไลบรารีและตรวจสอบ Dependencies ---")
 
@@ -186,7 +190,9 @@ except ImportError:
             )
             optuna = None
     else:
-        logging.error("ไลบรารี 'optuna' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        logging.warning(
+            "ไลบรารี 'optuna' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False -- ข้ามการปรับแต่ง"
+        )
         optuna = None
 # pragma: cover
 
@@ -240,7 +246,9 @@ except ImportError:
             Pool = None
             catboost = None
     else:
-        logging.error("ไลบรารี 'catboost' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        logging.warning(
+            "ไลบรารี 'catboost' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False -- ข้ามขั้นตอน CatBoost"
+        )
         CatBoostClassifier = None
         Pool = None
         catboost = None
@@ -300,7 +308,9 @@ except ImportError:
             )
         shap = None
     else:
-        logging.error("ไลบรารี 'shap' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        logging.warning(
+            "ไลบรารี 'shap' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False -- ข้ามการคำนวณ SHAP"
+        )
         shap = None
 # pragma: cover
 
@@ -354,15 +364,32 @@ except ImportError:
 
 # --- Colab/Drive Setup ---
 def is_colab():
-    """Return True if running within Google Colab."""  # [Patch v5.3.3]
+    """Return True if running within Google Colab."""  # [Patch v5.4.9]
+    # [Patch] Require an interactive kernel to avoid mount errors when running
+    # scripts externally. Environment variables alone are not sufficient.
+    if os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("COLAB_GPU"):
+        try:
+            import google.colab  # noqa: F401
+            ip = get_ipython()
+            if ip and getattr(ip, "kernel", None):
+                return True
+        except Exception:
+            return False
     try:
-        import google.colab  # noqa: F401
-        return True
-    except ImportError:
+        ip = get_ipython()
+        return (
+            bool(ip)
+            and getattr(ip, "kernel", None) is not None
+            and "google.colab" in str(ip.__class__)
+        )
+    except Exception:
         return False
 
 FILE_BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if is_colab():
+FILE_BASE_OVERRIDE = os.getenv("FILE_BASE_OVERRIDE")
+if FILE_BASE_OVERRIDE and os.path.isdir(FILE_BASE_OVERRIDE):
+    FILE_BASE = FILE_BASE_OVERRIDE
+elif is_colab():
     from google.colab import drive
     logging.info("(Info) รันบน Google Colab – กำลัง mount Google Drive...")
     try:
@@ -373,6 +400,8 @@ if is_colab():
         logging.warning(
             f"(Warning) ล้มเหลวในการ mount Drive: {e_drive} -- ดำเนินการต่อโดยใช้ Local Path แทน"
         )
+        if FILE_BASE_OVERRIDE and os.path.isdir(FILE_BASE_OVERRIDE):
+            FILE_BASE = FILE_BASE_OVERRIDE
 else:
     logging.info(
         "(Info) ไม่ใช่ Colab – สมมติรันบน VPS และโฟลเดอร์ Google Drive ถูกซิงก์ไว้เรียบร้อยแล้ว"
@@ -539,6 +568,18 @@ pattern_label_map = {
 }
 logging.debug(f"Pattern Label Map: {pattern_label_map}")
 
+# Default timezone used when localizing naive datetime values
+DEFAULT_NAIVE_TZ = "UTC"
+
+# Default data types for CSV loading to reduce memory usage
+DEFAULT_DTYPE_MAP = {
+    "Open": "float32",
+    "High": "float32",
+    "Low": "float32",
+    "Close": "float32",
+    "Volume": "int32",
+}
+
 # --- Multi-Fund & IB Config ---
 MULTI_FUND_MODE = True
 FUND_PROFILES = {
@@ -550,6 +591,15 @@ FUND_PROFILES = {
 }
 DEFAULT_FUND_NAME = "NORMAL"
 IB_COMMISSION_PER_LOT = 7.0
+
+from dataclasses import dataclass
+
+@dataclass
+class DefaultConfig:
+    OUTPUT_DIR: str = DEFAULT_LOG_DIR
+    DATA_FILE_PATH_M1: str = DEFAULT_CSV_PATH_M1
+    DATA_FILE_PATH_M15: str = DEFAULT_CSV_PATH_M15
+    DEFAULT_RISK_PER_TRADE: float = FUND_PROFILES.get(DEFAULT_FUND_NAME, {}).get("risk", 0.01)
 logging.info(f"Multi-Fund Mode: {MULTI_FUND_MODE}")
 if MULTI_FUND_MODE:
     logging.info(f"Fund Profiles: {list(FUND_PROFILES.keys())}")
@@ -580,16 +630,26 @@ logging.debug("Setting Backtesting Parameters...")
 N_WALK_FORWARD_SPLITS = 5       # Number of folds for final backtest (increased to 5)
 INITIAL_CAPITAL = 100.0         # Starting capital for simulation
 POINT_VALUE = 0.1               # Value per point for 0.01 lot size
-MAX_CONCURRENT_ORDERS = 5       # Max concurrent orders per side (BUY/SELL)
+MAX_CONCURRENT_ORDERS = 7       # [Patch v5.3.5] Max concurrent orders per side (BUY/SELL)
 MAX_HOLDING_BARS = 24           # Max bars an order can be held
 COMMISSION_PER_001_LOT = 0.10   # Commission per 0.01 lot (USD)
 SPREAD_POINTS = 2.0             # Fixed spread in points
 MIN_SLIPPAGE_POINTS = -5.0      # Minimum slippage in points (negative means better price)
 MAX_SLIPPAGE_POINTS = -1.0      # Maximum slippage in points (negative means better price)
+OMS_MARGIN_PIPS = 20.0          # [Patch v5.5.8] Minimum SL distance from entry
+OMS_MAX_DISTANCE_PIPS = 1000.0  # [Patch v5.5.8] Max allowed SL/TP distance
 
 # --- Entry/Exit Logic Parameters ---
 logging.debug("Setting Entry/Exit Logic Parameters...")
-MIN_SIGNAL_SCORE_ENTRY = 2.0    # Minimum signal score required to open an order
+# [Patch] Allow MIN_SIGNAL_SCORE_ENTRY override via environment
+MIN_SIGNAL_SCORE_ENTRY = get_env_float("MIN_SIGNAL_SCORE_ENTRY", 0.3)
+# [Patch v5.3.9] Adaptive threshold settings
+ADAPTIVE_SIGNAL_SCORE_WINDOW = 1000   # Bars used for quantile calculation
+ADAPTIVE_SIGNAL_SCORE_QUANTILE = 0.4  # [Patch v5.7.1] Lower quantile (40th)
+MIN_SIGNAL_SCORE_ENTRY_MIN = 0.3      # Clamp lower bound
+MIN_SIGNAL_SCORE_ENTRY_MAX = 3.0      # Clamp upper bound
+MIN_SIGNAL_SCORE_ENTRY = max(MIN_SIGNAL_SCORE_ENTRY_MIN, min(MIN_SIGNAL_SCORE_ENTRY_MAX, MIN_SIGNAL_SCORE_ENTRY))
+USE_ADAPTIVE_SIGNAL_SCORE = True
 BASE_TP_MULTIPLIER = 1.8        # Base R-multiple for TP2 (before dynamic adjustment)
 BASE_BE_SL_R_THRESHOLD = 1.0    # Base R-multiple threshold to move SL to Breakeven
 ADAPTIVE_TSL_START_ATR_MULT = 1.5 # ATR multiplier from entry price to start Trailing Stop Loss
@@ -606,17 +666,27 @@ M1_ENTRY_MACD_HIST_THRESH = -0.1  # (Not directly used in current logic, kept fo
 M15_TREND_EMA_FAST = 50         # Fast EMA period for M15 Trend Filter
 M15_TREND_EMA_SLOW = 200        # Slow EMA period for M15 Trend Filter
 M15_TREND_RSI_PERIOD = 14       # RSI period for M15 Trend Filter
-M15_TREND_RSI_UP = 52           # RSI threshold for M15 uptrend
-M15_TREND_RSI_DOWN = 48         # RSI threshold for M15 downtrend
-SESSION_TIMES_UTC = {"Asia": (0, 8), "London": (7, 16), "NY": (13, 21)} # Session times in UTC
+M15_TREND_RSI_UP = 51           # [Patch v5.6.4] Relaxed M15 trend zone thresholds
+M15_TREND_RSI_DOWN = 49         # [Patch v5.6.4] Relaxed M15 trend zone thresholds
+
+session_env = os.getenv("SESSION_TIMES_UTC")
+try:
+    SESSION_TIMES_UTC = json.loads(session_env) if session_env else {"Asia": (22, 8), "London": (7, 16), "NY": (13, 21)}
+except Exception:
+    logging.warning("(Warning) SESSION_TIMES_UTC env var invalid. Using default.")
+    SESSION_TIMES_UTC = {"Asia": (22, 8), "London": (7, 16), "NY": (13, 21)}
 logging.debug(f"Session Times (UTC): {SESSION_TIMES_UTC}")
+
+# --- Signal Toggle Configuration ---
+USE_MACD_SIGNALS = True  # Enable MACD conditions in simple signal functions
+USE_RSI_SIGNALS = True   # Enable RSI conditions in simple signal functions
 
 # --- Fold-Specific Configuration ---
 # Allows overriding parameters for specific walk-forward folds
 logging.debug("Setting Fold-Specific Configuration...")
 ENTRY_CONFIG_PER_FOLD = {
     # Fold Index: {Config Dictionary}
-    0: {"sl_multiplier": 2.0, "gain_z_thresh": 0.3, "cooldown_sec": 0, "min_signal_score": MIN_SIGNAL_SCORE_ENTRY, },
+    0: {"sl_multiplier": 2.8, "gain_z_thresh": 0.3, "cooldown_sec": 0, "min_signal_score": MIN_SIGNAL_SCORE_ENTRY, },
     1: {"sl_multiplier": 2.0, "gain_z_thresh": 0.3, "cooldown_sec": 0, "min_signal_score": MIN_SIGNAL_SCORE_ENTRY, },
     2: {"sl_multiplier": 2.0, "gain_z_thresh": 0.3, "cooldown_sec": 0, "min_signal_score": MIN_SIGNAL_SCORE_ENTRY, },
     3: {"sl_multiplier": 2.0, "gain_z_thresh": 0.3, "cooldown_sec": 0, "min_signal_score": MIN_SIGNAL_SCORE_ENTRY, },
@@ -628,29 +698,32 @@ logging.debug(f"Entry Config Per Fold (First Fold Example): {ENTRY_CONFIG_PER_FO
 logging.debug("Setting Order Management System (OMS) Configuration...")
 ENABLE_PARTIAL_TP = True        # Enable/disable partial take profit logic
 PARTIAL_TP_LEVELS = [           # Define partial TP levels
-    {"r_multiple": 0.8, "close_pct": 0.5}, # Close 50% at 0.8R
+    {"r_multiple": 0.25, "close_pct": 0.5},  # Close 50% at 0.5 ATR
+    {"r_multiple": 0.5, "close_pct": 0.5},   # Close remaining at 1 ATR
 ]
 PARTIAL_TP_MOVE_SL_TO_ENTRY = True # Move SL to entry after first partial TP?
 ENABLE_KILL_SWITCH = True       # Enable/disable kill switch mechanism
-KILL_SWITCH_MAX_DD_THRESHOLD = 0.20 # Max drawdown % before activating kill switch
-KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 7 # Max consecutive losses before activating kill switch
-MAX_DRAWDOWN_THRESHOLD = 0.30   # Max drawdown % threshold to block new orders (e.g., 30%)
+KILL_SWITCH_MAX_DD_THRESHOLD = 0.25 # [Patch v5.3.5] Max drawdown % before activating kill switch
+KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 5 # [Patch] Lower threshold for earlier soft cooldown
+MAX_DRAWDOWN_THRESHOLD = 0.15   # [Patch] Reduce drawdown threshold to block orders sooner
 logging.info(f"Kill Switch Enabled: {ENABLE_KILL_SWITCH} (DD > {KILL_SWITCH_MAX_DD_THRESHOLD*100:.0f}%, Losses > {KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD})")
 logging.info(f"Max Drawdown Threshold (Block New Orders): {MAX_DRAWDOWN_THRESHOLD*100:.0f}%")
 
 # --- Spike Guard & Recovery Mode Configuration ---
 logging.debug("Setting Spike Guard & Recovery Mode Configuration...")
 ENABLE_SPIKE_GUARD = True       # Enable/disable spike guard filter (mainly London session)
+ENABLE_SOFT_COOLDOWN = True     # Enable/disable soft cooldown logic
 RECOVERY_MODE_CONSECUTIVE_LOSSES = 4 # Consecutive losses to enter recovery mode
 RECOVERY_MODE_LOT_MULTIPLIER = 0.5 # Lot size multiplier during recovery mode
 logging.info(f"Spike Guard Enabled: {ENABLE_SPIKE_GUARD}")
+logging.info(f"Soft Cooldown Enabled: {ENABLE_SOFT_COOLDOWN}")
 logging.info(f"Recovery Mode Enabled: Losses >= {RECOVERY_MODE_CONSECUTIVE_LOSSES}, Lot Multiplier: {RECOVERY_MODE_LOT_MULTIPLIER}")
 
 # --- Re-Entry Configuration ---
 logging.debug("Setting Re-Entry Configuration...")
 USE_REENTRY = True              # Enable/disable re-entry logic
 REENTRY_COOLDOWN_BARS = 1       # Cooldown (in bars) after TP before allowing re-entry
-REENTRY_MIN_PROBA_THRESH = 0.5 # Minimum ML probability threshold for re-entry (uses META_MIN_PROBA_THRESH)
+REENTRY_MIN_PROBA_THRESH = 0.45 # Minimum ML probability threshold for re-entry (uses META_MIN_PROBA_THRESH)
 logging.info(f"Re-Entry Enabled: {USE_REENTRY} (Cooldown: {REENTRY_COOLDOWN_BARS} bars, Threshold: {REENTRY_MIN_PROBA_THRESH})")
 
 # --- Forced Entry Configuration ---
@@ -665,8 +738,8 @@ USE_GAIN_Z_FOR_FORCED_ENTRY = False # (Not used)
 USE_CANDLE_RATIO_FOR_FORCED_ENTRY = False # (Not used)
 FORCED_ENTRY_CHECK_MARKET_COND = True # Check market conditions (ATR, GainZ) before FE?
 FORCED_ENTRY_MAX_ATR_MULT = 2.5 # Max ATR multiplier allowed for FE
-FORCED_ENTRY_MIN_GAIN_Z_ABS = 1.0 # Min absolute Gain_Z required for FE
-FORCED_ENTRY_ALLOWED_REGIMES = ["Normal", "Breakout", "StrongTrend"] # Allowed patterns for FE
+FORCED_ENTRY_MIN_GAIN_Z_ABS = 0.5 # [Patch v5.6.4] Lower Gain_Z requirement for FE
+FORCED_ENTRY_ALLOWED_REGIMES = ["Normal", "Breakout", "StrongTrend", "Reversal", "InsideBar", "Choppy"] # [Patch v5.6.4] Allow more patterns for FE
 FE_ML_FILTER_THRESHOLD = 0.40   # ML probability threshold for filtering FE (if used)
 ADAPTIVE_COOLDOWN_LOSS_MULTIPLIER = 0.2 # (Not directly used in FE, kept for potential future use)
 forced_entry_max_consecutive_losses = 2 # Max consecutive FE losses before temporary disable
@@ -695,12 +768,19 @@ PATTERN_CHOPPY_CANDLE_RATIO = 0.3 # Min candle ratio for 'Choppy' pattern
 PATTERN_CHOPPY_WICK_RATIO = 0.6 # Max wick ratio for 'Choppy' pattern
 
 # --- Drift & Data Quality Configuration ---
+
 logging.debug("Setting Drift & Data Quality Configuration...")
-DRIFT_WASSERSTEIN_THRESHOLD = 0.1 # Wasserstein Distance threshold for drift alert
+
+# [Patch v5.5.4] Allow override via environment variable
+DRIFT_WASSERSTEIN_THRESHOLD = get_env_float("DRIFT_WASSERSTEIN_THRESHOLD", 0.1)
 DRIFT_TTEST_ALPHA = 0.05        # Alpha level for T-test drift detection
 SIGNIFICANCE_LEVEL = 0.05       # (Not directly used, kept for potential analysis)
 M1_FEATURES_FOR_DRIFT = []      # Will be populated in clean_m1_data (Part 5)
 MAX_NAT_RATIO_THRESHOLD = 0.05  # Max allowed NaT ratio after datetime parsing
+
+# Drift override thresholds
+RSI_DRIFT_OVERRIDE_THRESHOLD = 0.65  # Threshold to ignore RSI scoring when drift is high
+ATR_DRIFT_OVERRIDE_THRESHOLD = 0.25  # Threshold to enable gain-based exit on high ATR drift
 
 # --- Dynamic Adjustment Configuration ---
 logging.debug("Setting Dynamic Adjustment Configuration...")
@@ -708,6 +788,9 @@ DYNAMIC_GAINZ_DRIFT_THRESHOLD = 0.10 # Wasserstein threshold on Gain_Z to trigge
 DYNAMIC_GAINZ_ADJUSTMENT = 0.1  # Amount to add to Gain_Z entry threshold on high drift
 DYNAMIC_RISK_DD_THRESHOLD = 12.0 # Drawdown % to trigger risk reduction (not used)
 DYNAMIC_RISK_REDUCTION_FACTOR = 0.7 # Factor to reduce risk by on high DD (not used)
+ENABLE_ADAPTIVE_SLTP = False      # Toggle ATR-based SL/TP multipliers
+ENABLE_ADAPTIVE_RISK = False      # Toggle dynamic risk allocation
+ENABLE_BEST_PARAM_LOGGING = True  # Save best params per fold
 
 logging.info("Part 2: Core Parameters & Strategy Settings Loaded.")
 # === END OF PART 2/12 ===
