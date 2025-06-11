@@ -9,9 +9,25 @@
 # <<< MODIFIED v4.8.1: Refined auto-train logic (log loading, context cols), confirmed dtype passing, verified model loading checks, added more robust function call checks >>>
 # <<< MODIFIED v4.8.2: Corrected SyntaxError in __main__ block (added except/finally for the main try block), updated log messages and versioning, robust global access in finally >>>
 # <<< MODIFIED v4.8.3: Applied SyntaxError fix for try-except global variable checks to all relevant globals in this part. >>>
-import logging
-import os
-import sys
+import logging, os, sys, json
+# [Patch v5.2.0] เพิ่มโฟลเดอร์ project root เข้า sys.path เพื่อป้องกัน ImportError
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+if 'pytest' in sys.modules:
+    cfg = sys.modules.get('src.config')
+    if cfg is not None and getattr(cfg, '__file__', None) is None and hasattr(cfg, 'ENTRY_CONFIG_PER_FOLD'):
+        DEFAULT_ENTRY_CONFIG_PER_FOLD = cfg.ENTRY_CONFIG_PER_FOLD
+        logger = getattr(cfg, 'logger', logging.getLogger(__name__))
+    else:
+        DEFAULT_ENTRY_CONFIG_PER_FOLD = {}
+        logger = logging.getLogger(__name__)
+else:
+    try:
+        from src.config import logger, ENTRY_CONFIG_PER_FOLD as DEFAULT_ENTRY_CONFIG_PER_FOLD
+    except Exception:  # pragma: no cover - fallback for tests
+        logger = logging.getLogger(__name__)
+        DEFAULT_ENTRY_CONFIG_PER_FOLD = {}
 
 # --------------------------------------------
 # =============================================================================
@@ -28,31 +44,21 @@ def print_gpu_utilization(_=None):
     """ฟังก์ชันสำรองสำหรับแสดงการใช้ GPU (ไม่ทำอะไร)."""
     pass
 
-# --------------------------------------------
-# นำเข้า `ENTRY_CONFIG_PER_FOLD` จาก `config.py` ให้กลายเป็น `DEFAULT_ENTRY_CONFIG_PER_FOLD`
-try:
-    if 'src.config' in sys.modules:
-        DEFAULT_ENTRY_CONFIG_PER_FOLD = sys.modules['src.config'].ENTRY_CONFIG_PER_FOLD
-    else:
-        from config import ENTRY_CONFIG_PER_FOLD as DEFAULT_ENTRY_CONFIG_PER_FOLD
-except Exception:
-    DEFAULT_ENTRY_CONFIG_PER_FOLD = {}
-# --------------------------------------------
 import time
-from data_loader import (
+from src.data_loader import (
     setup_output_directory as dl_setup_output_directory,
     load_data,
     prepare_datetime,
     safe_load_csv_auto,
 )
-from features import (
+from src.features import (
     calculate_m15_trend_zone,
     engineer_m1_features,
     clean_m1_data,
     calculate_m1_entry_signals,
     load_features_for_model,
 )
-from src.strategy import run_all_folds_with_threshold
+from src.strategy import run_all_folds_with_threshold, train_and_export_meta_model
 import pandas as pd
 import numpy as np
 import shutil # For file moving in pipeline mode
@@ -60,6 +66,15 @@ import traceback
 import glob
 from joblib import load # For loading models
 import gc # For memory management
+
+# [Patch] Initialize pynvml to prevent NameError during GPU checks
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+except Exception:  # pragma: no cover - allow running without NVML
+    pynvml = None
+    nvml_handle = None
 
 # Ensure global configurations are accessible if run independently
 # Define defaults if globals are not found
@@ -82,10 +97,11 @@ DEFAULT_DRIFT_WASSERSTEIN_THRESHOLD = 0.1
 DEFAULT_DRIFT_TTEST_ALPHA = 0.05
 DEFAULT_INITIAL_CAPITAL = 100.0
 DEFAULT_N_WALK_FORWARD_SPLITS = 5
-DEFAULT_OUTPUT_BASE_DIR = "/content/drive/MyDrive/Phiradon168/logs"
-DEFAULT_OUTPUT_DIR_NAME = "outputgpt_v4.8.4" # Note: This might be updated by Part 1 if run
-# [Patch v5.0.11] Use CSV paths relative to this project for portability
+# [Patch v5.2.5] Use project-relative paths for portability
 _BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_OUTPUT_BASE_DIR = os.path.join(_BASE_DIR, "logs")
+DEFAULT_OUTPUT_DIR_NAME = "outputgpt_v4.8.4"  # Note: This might be updated by Part 1 if run
+# [Patch v5.0.11] Use CSV paths relative to this project for portability
 DEFAULT_DATA_FILE_PATH_M15 = os.path.join(_BASE_DIR, "XAUUSD_M15.csv")
 DEFAULT_DATA_FILE_PATH_M1 = os.path.join(_BASE_DIR, "XAUUSD_M1.csv")
 DEFAULT_META_META_CLASSIFIER_PATH = "meta_meta_classifier.pkl"
@@ -124,6 +140,19 @@ DEFAULT_EARLY_STOPPING_ROUNDS = 200
 DEFAULT_CATBOOST_GPU_RAM_PART = 0.95
 DEFAULT_SHAP_IMPORTANCE_THRESHOLD = 0.01
 DEFAULT_PERMUTATION_IMPORTANCE_THRESHOLD = 0.001
+
+# [Patch v5.2.4] Ensure default output directory exists
+def ensure_default_output_dir(path=DEFAULT_OUTPUT_DIR):
+    """สร้างโฟลเดอร์ผลลัพธ์เริ่มต้นหากยังไม่มี"""
+    try:
+        os.makedirs(path, exist_ok=True)
+        logging.info(f"   (Setup) ตรวจสอบโฟลเดอร์ผลลัพธ์: {path}")
+        return path
+    except Exception as e:
+        logging.error(f"   (Error) สร้างโฟลเดอร์ผลลัพธ์ไม่สำเร็จ: {e}", exc_info=True)
+        return None
+
+ensure_default_output_dir()
 
 try:
     OUTPUT_DIR
@@ -609,6 +638,41 @@ def train_models():
     return main(run_mode='TRAIN_MODEL_ONLY')
 
 
+# [Patch v5.0.14] Ensure features_main.json exists
+def ensure_main_features_file(output_dir):
+    """[Patch] Create default features_main.json if it does not exist."""
+    path = os.path.join(output_dir, "features_main.json")
+    if os.path.exists(path):
+        return path
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_META_CLASSIFIER_FEATURES, f, ensure_ascii=False, indent=2)
+        logging.info("[Patch] Created default features_main.json")
+    except Exception as e:
+        logging.error(f"[Patch] Failed to create features_main.json: {e}")
+    return path
+
+
+# [Patch v5.3.2] QA function to persist features_main.json
+def save_features_main_json(features, output_dir):
+    """[Patch] Save main features list, creating QA log if empty."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, 'features_main.json')
+    if features is None or len(features) == 0:
+        logger.warning("[QA] features_main.json is empty. Creating empty features file.")
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+        qa_log = os.path.join(output_dir, 'features_main_qa.log')
+        with open(qa_log, 'w', encoding='utf-8') as f:
+            f.write("[QA] features_main.json EMPTY. Please check feature engineering logic.\n")
+    else:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(features, f, ensure_ascii=False, indent=2)
+        logger.info(f"[QA] features_main.json saved successfully ({len(features)} features).")
+    return path
+
+
 # --- Main Execution Function ---
 def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=None):
     """
@@ -668,6 +732,9 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
             logging.info(f"   (Info) Output directory already set: {OUTPUT_DIR}")
             # Ensure the directory exists and is writable even if already set
             dl_setup_output_directory(os.path.dirname(OUTPUT_DIR), os.path.basename(OUTPUT_DIR))
+
+        # [Patch v5.0.14] Pre-create features_main.json to avoid warnings
+        ensure_main_features_file(OUTPUT_DIR)
 
         # --- Font Setup ---
         try:
@@ -770,10 +837,32 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
 
     if local_train_model and run_mode == 'TRAIN_MODEL_ONLY':
         logging.info("\n(Starting) กำลัง Train Meta Classifier (L1 - Main Model Only)...")
-        train_log_path_base = os.path.join(OUTPUT_DIR, "trade_log_v32_walkforward")
-        train_m1_data_path_base = os.path.join(OUTPUT_DIR, "final_data_m1_v32_walkforward")
+        train_log_path_base = os.path.join(
+            OUTPUT_DIR,
+            "trade_log_v32_walkforward_prep_data_NORMAL",
+        )  # [Patch v5.1.6] Use PREPARE_TRAIN_DATA generated trade log
+        train_m1_data_path_base = os.path.join(
+            OUTPUT_DIR,
+            "final_data_m1_v32_walkforward_prep_data_NORMAL",
+        )  # [Patch v5.1.6] Use PREPARE_TRAIN_DATA generated M1 data
+
+        logging.info(
+            f"TRAIN_MODEL_ONLY: กำลังโหลด Trade Log จาก: {train_log_path_base}.csv(.gz)"
+        )
+        logging.info(
+            f"TRAIN_MODEL_ONLY: กำลังโหลด M1 Data จาก: {train_m1_data_path_base}.csv(.gz)"
+        )
         train_log_path = train_log_path_base + ".csv.gz" if os.path.exists(train_log_path_base + ".csv.gz") else train_log_path_base + ".csv"
         train_m1_data_path = train_m1_data_path_base + ".csv.gz" if os.path.exists(train_m1_data_path_base + ".csv.gz") else train_m1_data_path_base + ".csv"
+
+        if not (os.path.exists(train_log_path) and os.path.exists(train_m1_data_path)):
+            logging.info("   (Info) ไม่พบไฟล์ฝึกสั่ง PREPARE_TRAIN_DATA อัตโนมัติ")
+            prepare_suffix = prepare_train_data()
+            if prepare_suffix is None:
+                logging.critical("   (Error) PREPARE_TRAIN_DATA ล้มเหลว ไม่สามารถ Train Model")
+                return None
+            train_log_path = train_log_path_base + ".csv.gz" if os.path.exists(train_log_path_base + ".csv.gz") else train_log_path_base + ".csv"
+            train_m1_data_path = train_m1_data_path_base + ".csv.gz" if os.path.exists(train_m1_data_path_base + ".csv.gz") else train_m1_data_path_base + ".csv"
 
         if os.path.exists(train_log_path) and os.path.exists(train_m1_data_path):
             logging.info(f"   พบไฟล์ที่จำเป็น: Log='{os.path.basename(train_log_path)}', M1='{os.path.basename(train_m1_data_path)}'")
@@ -930,6 +1019,23 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
             else:
                 logging.info("   (Success) Final M1 Data ผ่านการตรวจสอบ NaN.")
 
+            # [Patch v5.1.6] สร้างไฟล์ features_main.json จากคอลัมน์จริงของ M1 Data
+            # ก่อนที่จะเริ่มขั้นตอน Backtest หรือการบีบอัดไฟล์
+            try:
+                features_list_actual = [
+                    c for c in df_m1_final.columns
+                    if c not in ["datetime", "is_tp", "is_sl"]
+                    and pd.api.types.is_numeric_dtype(df_m1_final[c])
+                ]
+                features_path = os.path.join(OUTPUT_DIR, "features_main.json")
+                with open(features_path, "w", encoding="utf-8") as f_feat:
+                    json.dump(features_list_actual, f_feat, ensure_ascii=False, indent=2)
+                logging.info(
+                    f"[Patch] สร้าง features_main.json จาก M1 Data สำเร็จ ({len(features_list_actual)} features)."
+                )
+            except Exception as e_feat:
+                logging.error(f"[Patch] สร้าง features_main.json ล้มเหลว: {e_feat}")
+
             logging.debug("   Cleaning up intermediate dataframes after data preparation...")
             del df_m15_raw, df_m1_raw, df_m15_dt, df_m1_dt, df_m15_trend
             del df_m1_features, df_m1_cleaned, df_m1_merged, df_m1_merged_with_signals
@@ -979,8 +1085,12 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                     del df_m1_final, prep_trade_log_wf
                     gc.collect()
                     return current_run_suffix
-                except NameError as ne:
-                    logging.critical(f"   (CRITICAL) NameError during PREPARE_TRAIN_DATA backtest: {ne}. Likely missing function definition.", exc_info=True)
+                except (NameError, UnboundLocalError) as ne:
+                    # [Patch] Catch UnboundLocalError along with NameError to prevent pipeline crash
+                    logging.critical(
+                        f"   (CRITICAL) NameError/UnboundLocalError during PREPARE_TRAIN_DATA backtest: {ne}. Likely missing function definition.",
+                        exc_info=True,
+                    )
                     return None
                 except Exception as e_prep_run_save:
                     logging.error(f"   (Error) Failed to run backtest or save PREPARE_TRAIN_DATA results: {e_prep_run_save}", exc_info=True)
@@ -1208,6 +1318,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                     except Exception as e_drift_sum:
                         logging.error(f"   Error summarizing/saving drift results: {e_drift_sum}", exc_info=True)
 
+                qa_log_path = os.path.join(OUTPUT_DIR, '.qa.log')
                 if df_walk_forward_results_pd_fund is not None and not df_walk_forward_results_pd_fund.empty:
                     logging.info(f"\n--- Saving Results for Fund: {fund_name} (Suffix: {final_run_suffix_fund}) ---")
                     metrics_all_fund = {**metrics_buy_overall_fund, **metrics_sell_overall_fund}
@@ -1223,16 +1334,26 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                         logging.error(f"   (Error) Failed to save metrics summary: {e}", exc_info=True)
 
                     log_file_path = os.path.join(OUTPUT_DIR, f"trade_log_v32_walkforward{final_run_suffix_fund}.csv")
+                    saved_path = None
                     try:
                         trade_log_wf_fund.to_csv(log_file_path + ".gz", index=False, encoding="utf-8", compression="gzip")
+                        saved_path = log_file_path + ".gz"
                         logging.info(f"   (Success) Saved Trade Log (GZ): {log_file_path}.gz")
                     except Exception as e_gz:
                         logging.warning(f"   (Warning) Failed to save trade log as GZ: {e_gz}. Attempting CSV...")
                         try:
                             trade_log_wf_fund.to_csv(log_file_path, index=False, encoding="utf-8")
+                            saved_path = log_file_path
                             logging.info(f"   (Success) Saved Trade Log (CSV - Fallback): {log_file_path}")
                         except Exception as e_csv:
                             logging.error(f"   (Error) Failed to save trade log (CSV): {e_csv}", exc_info=True)
+                    if saved_path:
+                        with open(qa_log_path, 'a', encoding='utf-8') as qa_f:
+                            if trade_log_wf_fund.empty:
+                                qa_f.write(f"NO_TRADES {final_run_suffix_fund}\n")
+                            else:
+                                qa_f.write(f"TRADES {len(trade_log_wf_fund)} {final_run_suffix_fund}\n")
+                        assert os.path.exists(saved_path)
 
                     try:
                         fold_boundaries = [df_m1_final.index.min()] + [df_m1_final.iloc[test_index].index.max() for _, test_index in tscv.split(df_m1_final)]
@@ -1265,6 +1386,11 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
                             logging.error(f"   (Error) Failed to save final M1 data (CSV): {e_csv}", exc_info=True)
                 else:
                     logging.error(f"(Error) Final Walk-forward (Fund: {fund_name}) ไม่ได้สร้างผลลัพธ์รวม (df_walk_forward_results_pd_fund is empty or None).")
+                    log_file_path = os.path.join(OUTPUT_DIR, f"trade_log_v32_walkforward{final_run_suffix_fund}.csv")
+                    pd.DataFrame().to_csv(log_file_path, index=False)
+                    with open(qa_log_path, 'a', encoding='utf-8') as qa_f:
+                        qa_f.write(f"NO_TRADES {final_run_suffix_fund}\n")
+                    assert os.path.exists(log_file_path)
                 del df_walk_forward_results_pd_fund, trade_log_wf_fund, all_equity_histories_fund, all_fold_metrics_fund
                 gc.collect()
 
@@ -1311,6 +1437,7 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
             logging.info("Attempting to shut down pynvml...")
             if 'print_gpu_utilization' in globals() and callable(print_gpu_utilization): print_gpu_utilization("Final State")
             pynvml.nvmlShutdown()
+            nvml_handle = None  # [Patch] Clear handle after shutdown
             logging.info("(Success) ปิดการทำงาน pynvml สำเร็จ.")
         except Exception as e:
             logging.warning(f"(Warning) เกิดข้อผิดพลาดขณะปิด pynvml: {e}")
@@ -1326,14 +1453,14 @@ def main(run_mode='FULL_PIPELINE', skip_prepare=False, suffix_from_prev_step=Non
 # ==============================================================================
 if __name__ == "__main__":
     start_time_script = time.time()
-    logging.info(f"(Starting) Script Gold Trading AI v4.8.4...") # Updated version
+    logger.info(f"(Starting) Script Gold Trading AI v4.8.4...")
 
     selected_run_mode = 'FULL_PIPELINE'
     # selected_run_mode = 'PREPARE_TRAIN_DATA'
     # selected_run_mode = 'TRAIN_MODEL_ONLY'
     # selected_run_mode = 'FULL_RUN'
 
-    logging.info(f"(Starting) กำลังเริ่มการทำงานหลัก (main) ในโหมด: {selected_run_mode}...")
+    logger.info(f"(Starting) กำลังเริ่มการทำงานหลัก (main) ในโหมด: {selected_run_mode}...")
     final_run_suffix = None
     # <<< MODIFIED v4.8.2: Ensured this try...except...finally block is correctly structured >>>
     try:
@@ -1378,19 +1505,22 @@ if __name__ == "__main__":
         else:
             logging.info(f"\n(Skipping Log Analysis) Run mode '{selected_run_mode}' does not require log analysis.")
 
-    except SystemExit as se_main: # Renamed to avoid conflict
-        logging.critical(f"\n(Critical Error) สคริปต์ออกก่อนเวลา: {se_main}")
-        # Optionally re-raise or handle further if needed: raise se_main
+    except SystemExit as se_main:
+        logger.critical(f"\n(Critical Error) สคริปต์ออกก่อนเวลา: {se_main}")
     except KeyboardInterrupt:
-        logging.warning("\n(Stopped) การทำงานหยุดโดยผู้ใช้ (KeyboardInterrupt).")
-    except NameError as ne_main: # Renamed
-        logging.critical(f"\n(Error) NameError in __main__: '{ne_main}'. Critical function or variable likely missing.", exc_info=True)
-    except Exception as e_main_general: # Renamed
-        logging.critical("\n(Error) เกิดข้อผิดพลาดที่ไม่คาดคิดใน __main__:", exc_info=True)
+        logger.warning("\n(Stopped) การทำงานหยุดโดยผู้ใช้ (KeyboardInterrupt).")
+    except NameError as ne_main:
+        logger.critical(
+            f"\n(Error) NameError in __main__: '{ne_main}'. Critical function or variable likely missing.",
+            exc_info=True,
+        )
+    except Exception as e_main_general:
+        logger.error("เกิดข้อผิดพลาดที่ไม่คาดคิด: %s", str(e_main_general), exc_info=True)
+        sys.exit(1)
     finally:
         end_time_script = time.time()
         total_duration = end_time_script - start_time_script
-        logging.info(f"\n(Finished) Script Gold Trading AI v4.8.4 เสร็จสมบูรณ์!") # Updated version
+        logger.info(f"\n(Finished) Script Gold Trading AI v4.8.4 เสร็จสมบูรณ์!")
         
         final_tuning_mode_log = "Unknown"
         # Check globals first, then locals if not found in globals (though it should be global)
@@ -1398,7 +1528,7 @@ if __name__ == "__main__":
             final_tuning_mode_log = globals()['tuning_mode_used']
         elif 'tuning_mode_used' in locals() and locals()['tuning_mode_used'] is not None: # Check local scope as fallback
             final_tuning_mode_log = locals()['tuning_mode_used']
-        logging.info(f"   Tuning Mode ที่ใช้: {final_tuning_mode_log}")
+        logger.info(f"   Tuning Mode ที่ใช้: {final_tuning_mode_log}")
 
         output_dir_final_path = None
         try:
@@ -1414,17 +1544,17 @@ if __name__ == "__main__":
                 output_dir_final_path = output_dir_val
 
             if output_dir_final_path and os.path.exists(output_dir_final_path):
-                logging.info(f"   ผลลัพธ์ถูกบันทึกไปที่: {output_dir_final_path}")
-                logging.info(f"   ไฟล์ Log หลัก: {log_filename_val}") # Directly use LOG_FILENAME
+                logger.info(f"   ผลลัพธ์ถูกบันทึกไปที่: {output_dir_final_path}")
+                logger.info(f"   ไฟล์ Log หลัก: {log_filename_val}")
             elif output_dir_final_path:
-                logging.warning(f"   (Warning) ไม่พบ Output Directory ที่คาดหวัง: {output_dir_final_path}")
+                logger.warning(f"   (Warning) ไม่พบ Output Directory ที่คาดหวัง: {output_dir_final_path}")
             else:
-                logging.warning("   (Warning) ไม่สามารถกำหนด Output Directory path.")
+                logger.warning("   (Warning) ไม่สามารถกำหนด Output Directory path.")
         except Exception as e_report_path:
-            logging.warning(f"   (Warning) Error reporting output path: {e_report_path}")
+            logger.warning(f"   (Warning) Error reporting output path: {e_report_path}")
 
-        logging.info(f"   เวลาดำเนินการทั้งหมด: {total_duration:.2f} วินาที ({total_duration/60:.2f} นาที).")
-        logging.info("--- End of Script ---")
+        logger.info(f"   เวลาดำเนินการทั้งหมด: {total_duration:.2f} วินาที ({total_duration/60:.2f} นาที).")
+        logger.info("--- End of Script ---")
 
 # === END OF PART 10/12 ===
 # === START OF PART 11/12 ===
@@ -1439,7 +1569,7 @@ import time
 # import MetaTrader5 as mt5 # Import commented out as it's a placeholder
 # import pandas as pd # Import commented out as it's not used in placeholder
 
-logging.info("Loading Part 11: MT5 Connector (Placeholder)...")
+logger.info("Loading Part 11: MT5 Connector (Placeholder)...")
 
 # --- MT5 Connection Parameters (Placeholder Examples) ---
 # These would typically be loaded from a secure config file or environment variables

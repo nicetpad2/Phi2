@@ -18,6 +18,7 @@ import ta # Assumes 'ta' is imported and available (checked in Part 1)
 from sklearn.cluster import KMeans # For context column calculation
 from sklearn.preprocessing import StandardScaler # For context column calculation
 import gc # For memory management
+from src.utils.sessions import get_session_tag  # [Patch v5.1.3]
 
 _rsi_cache = {}  # [Patch v4.8.12] Cache RSIIndicator per period
 _atr_cache = {}  # [Patch v4.8.12] Cache AverageTrueRange per period
@@ -118,20 +119,31 @@ def rsi(series, period=14):
     # [Patch v4.8.12] Use module-level cache for RSIIndicator
     if series.empty: logging.debug("RSI: Input series is empty, returning empty series."); return pd.Series(dtype='float32')
     if 'ta' not in globals() or ta is None: logging.error("   (Error) RSI calculation failed: 'ta' library not loaded."); return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
+    # Convert to numeric and drop NaN/inf values
     series_numeric = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
-    if series_numeric.empty or len(series_numeric) < period: logging.warning(f"   (Warning) RSI calculation skipped: Not enough valid data points ({len(series_numeric)} < {period})."); return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
+    if series_numeric.empty or len(series_numeric) < period:
+        logging.warning(
+            f"   (Warning) RSI calculation skipped: Not enough valid data points ({len(series_numeric)} < {period})."
+        )
+        return pd.Series(np.nan, index=series.index, dtype='float32')
+    # [Patch v5.1.10] Drop duplicate timestamps to avoid reindex errors
+    if series_numeric.index.duplicated().any():
+        series_numeric = series_numeric[~series_numeric.index.duplicated(keep='first')]
     try:
         cache_key = period
         if cache_key not in _rsi_cache:
             _rsi_cache[cache_key] = ta.momentum.RSIIndicator(close=series_numeric, window=period, fillna=False)
         else:
             _rsi_cache[cache_key]._close = series_numeric
-        rsi_values = _rsi_cache[cache_key].rsi(); rsi_final = rsi_values.reindex(series.index).ffill()
-        del series_numeric, rsi_values; gc.collect()
-        return rsi_final.astype('float32')
+        rsi_series = _rsi_cache[cache_key].rsi()
+        # Reindex to original index with forward-fill
+        rsi_final = rsi_series.reindex(series.index, method='ffill').astype('float32')
+        del series_numeric, rsi_series
+        gc.collect()
+        return rsi_final
     except Exception as e:
         logging.error(f"   (Error) RSI calculation error for period {period}: {e}.", exc_info=True)
-        return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
+        return pd.Series(np.nan, index=series.index, dtype='float32')
 
 def atr(df_in, period=14):
     if not isinstance(df_in, pd.DataFrame): logging.error(f"ATR Error: Input must be a pandas DataFrame, got {type(df_in)}"); raise TypeError("Input must be a pandas DataFrame.")
@@ -271,28 +283,6 @@ def calculate_m15_trend_zone(df_m15):
         logging.error(f"(Error) การคำนวณ M15 Trend Zone ล้มเหลว: {e}", exc_info=True)
         result_df = pd.DataFrame(index=df_m15.index, data={"Trend_Zone": "NEUTRAL"}); result_df["Trend_Zone"] = result_df["Trend_Zone"].astype('category'); return result_df
 
-def get_session_tag(timestamp, session_times_utc=None):
-    if session_times_utc is None:
-        global SESSION_TIMES_UTC
-        try: session_times_utc_local = SESSION_TIMES_UTC
-        except NameError: logging.warning("get_session_tag: Global SESSION_TIMES_UTC not found, using default."); session_times_utc_local = {"Asia": (0, 8), "London": (7, 16), "NY": (13, 21)}
-    else: session_times_utc_local = session_times_utc
-    if pd.isna(timestamp): return "N/A"
-    try:
-        # Ensure timestamp is a pandas Timestamp object for tz_convert/tz_localize
-        if not isinstance(timestamp, pd.Timestamp):
-            timestamp = pd.Timestamp(timestamp) # Attempt conversion
-
-        ts_utc = timestamp.tz_convert('UTC') if timestamp.tzinfo else timestamp.tz_localize('UTC')
-        hour = ts_utc.hour; sessions = []
-        for name, (start, end) in session_times_utc_local.items():
-            if start <= end:
-                if start <= hour < end: sessions.append(name)
-            else:
-                if hour >= start or hour < end: sessions.append(name)
-        return "/".join(sorted(sessions)) if sessions else "Other"
-    except Exception as e: logging.error(f"   (Error) Error in get_session_tag for {timestamp}: {e}", exc_info=True); return "Error_Tagging"
-
 # [Patch v5.0.2] Exclude heavy engineering logic from coverage
 def engineer_m1_features(df_m1, timeframe_minutes=TIMEFRAME_MINUTES_M1, lag_features_config=None):  # pragma: no cover
     logging.info("(Processing) กำลังสร้าง Features M1 (v4.9.0)...") # <<< MODIFIED v4.9.0
@@ -342,9 +332,20 @@ def engineer_m1_features(df_m1, timeframe_minutes=TIMEFRAME_MINUTES_M1, lag_feat
             cluster_features=['Gain_Z','Volatility_Index','Candle_Ratio','RSI','ADX']; features_present=[f for f in cluster_features if f in df.columns and df[f].notna().any()]
             if len(features_present)<2 or len(df[features_present].dropna())<3: df['cluster']=0; logging.warning("         (Warning) Not enough valid features/samples for clustering.")
             else:
-                X_cluster_raw=df[features_present].copy().replace([np.inf,-np.inf],np.nan); X_cluster=X_cluster_raw.fillna(X_cluster_raw.median()).fillna(0)
-                if len(X_cluster)>=3: scaler=StandardScaler(); X_scaled=scaler.fit_transform(X_cluster); kmeans=KMeans(n_clusters=3,random_state=42,n_init=10); df['cluster']=kmeans.fit_predict(X_scaled)
-                else: df['cluster']=0; logging.warning("         (Warning) Not enough samples after cleaning for clustering.")
+                X_cluster_raw = df[features_present].copy().replace([np.inf, -np.inf], np.nan)
+                X_cluster = X_cluster_raw.fillna(X_cluster_raw.median()).fillna(0)
+                # [Patch v5.0.16] Skip KMeans if duplicate samples could cause ConvergenceWarning
+                if len(X_cluster) >= 3:
+                    scaler = StandardScaler(); X_scaled = scaler.fit_transform(X_cluster)
+                    if len(np.unique(X_scaled, axis=0)) < 3:
+                        df['cluster'] = 0
+                        logging.warning("         (Warning) Not enough unique samples for clustering.")
+                    else:
+                        kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+                        df['cluster'] = kmeans.fit_predict(X_scaled)
+                else:
+                    df['cluster'] = 0
+                    logging.warning("         (Warning) Not enough samples after cleaning for clustering.")
         except Exception as e_cluster: df['cluster']=0; logging.error(f"         (Error) Clustering failed: {e_cluster}.",exc_info=True)
         if 'cluster' in df.columns: df['cluster']=pd.to_numeric(df['cluster'],downcast='integer')
     if 'spike_score' not in df.columns:
@@ -1095,8 +1096,8 @@ def load_features_for_model(model_name, output_dir):  # pragma: no cover
     logging.info(f"   (Feature Load) Attempting to load features for '{model_name}' from: {features_file_path}")
 
     if not os.path.exists(features_file_path):
-        logging.warning(
-            f"   (Warning) Feature file not found for model '{model_name}': {os.path.basename(features_file_path)}"
+        logging.info(
+            f"   (Info) Feature file not found for model '{model_name}': {os.path.basename(features_file_path)}"
         )
         main_features_path = os.path.join(output_dir, "features_main.json")
         if model_name != "main" and os.path.exists(main_features_path):
@@ -1105,8 +1106,8 @@ def load_features_for_model(model_name, output_dir):  # pragma: no cover
             )
             features_file_path = main_features_path  # Use main path for fallback
         else:
-            logging.error(
-                "      (Fallback Failed) Main feature file also not found. Generating default features_main.json."
+            logging.info(
+                "      (Generating) Default features_main.json."
             )
             try:
                 os.makedirs(output_dir, exist_ok=True)

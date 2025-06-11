@@ -17,6 +17,7 @@ import sys
 import os
 import time
 import warnings
+import atexit
 import json
 import math
 import random
@@ -25,6 +26,11 @@ from joblib import load, dump as joblib_dump
 import traceback
 import pandas as pd
 import numpy as np
+AUTO_INSTALL_LIBS = False  # If False, skip auto-installation of libraries
+# อ่านเวอร์ชันจากไฟล์ VERSION
+VERSION_FILE = os.path.join(os.path.dirname(__file__), '..', 'VERSION')
+with open(VERSION_FILE, 'r', encoding='utf-8') as vf:
+    __version__ = vf.read().strip()
 from sklearn.model_selection import TimeSeriesSplit, train_test_split
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder # Added OrdinalEncoder back as it might be used by some logic
 from sklearn.metrics import (
@@ -41,34 +47,52 @@ from matplotlib.ticker import FuncFormatter
 from IPython import get_ipython
 import shutil
 import gzip
-import requests # For Font Download
+import requests  # For Font Download
 
 # --- Logging Configuration ---
 # กำหนดค่าพื้นฐานสำหรับการ Logging
 # สามารถปรับ level, format, และ filename ได้ตามต้องการ
-LOG_FILENAME = 'gold_ai_v4.8.4.log' # <<< MODIFIED v4.8.4: Updated log filename
-logging.basicConfig(
-    level=logging.INFO, # ระดับ Log เริ่มต้น (INFO, DEBUG, WARNING, ERROR, CRITICAL)
-    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler(LOG_FILENAME, mode='w', encoding='utf-8'), # บันทึกลงไฟล์ (เขียนทับทุกครั้งที่รัน)
-        logging.StreamHandler(sys.stdout) # แสดงผลทาง Console ด้วย
-    ]
+LOG_FILENAME = f'gold_ai_v{__version__}.log'
+
+# ตั้งค่า Logger กลางเพื่อให้โมดูลอื่น ๆ ใช้งานร่วมกัน
+logger = logging.getLogger('NiceGold')
+logger.setLevel(logging.WARNING)
+formatter = logging.Formatter(
+    '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 )
-logging.info("--- (Start) Gold AI v4.8.4 ---") # <<< MODIFIED v4.8.4: Updated version
-logging.info("--- กำลังโหลดไลบรารีและตรวจสอบ Dependencies ---")
+fh = logging.FileHandler(LOG_FILENAME, mode='w', encoding='utf-8')
+fh.setFormatter(formatter)
+sh = logging.StreamHandler(sys.stdout)
+sh.setFormatter(formatter)
+for h in logger.handlers:
+    try: h.close()
+    except Exception: pass
+logger.handlers.clear()
+logger.addHandler(fh)
+logger.addHandler(sh)
+logger.propagate = True
+atexit.register(logging.shutdown)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+# [Patch] Preserve any existing handlers (e.g., from test frameworks)
+# rather than clearing them so that external log capture still works.
+for handler in logger.handlers:
+    if handler not in root_logger.handlers:
+        root_logger.addHandler(handler)
+logger.info(f"--- (Start) Gold AI v{__version__} ---")
+logger.info("--- กำลังโหลดไลบรารีและตรวจสอบ Dependencies ---")
 
 # --- Library Installation & Checks ---
 # Helper function to check and log library version
 # [Patch v5.0.2] Exclude log_library_version from coverage
 def log_library_version(library_name, library_object):  # pragma: no cover
     """Logs the version of the imported library."""
+    # [Patch v5.1.0] ยืนยันว่าฟังก์ชันใช้ตัวแปร logger ที่นำเข้าไว้ด้านบน
     try:
         version = getattr(library_object, '__version__', 'N/A')
-        logging.info(f"   (Info) Using {library_name} version: {version}")
+        logger.info(f"   (Info) Using {library_name} version: {version}")
     except Exception as e:
-        logging.warning(f"   (Warning) Could not retrieve {library_name} version: {e}")
+        logger.warning(f"   (Warning) Could not retrieve {library_name} version: {e}")
 
 # Log versions of core libraries
 log_library_version("Pandas", pd)
@@ -85,37 +109,48 @@ try:
     from tqdm.notebook import tqdm
     logging.debug("tqdm library already installed.")
 except ImportError:
-    logging.info("   กำลังติดตั้งไลบรารี tqdm...")
-    try:
-        process = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "tqdm", "-q"],
-            check=True, capture_output=True, text=True,
-        )
-        logging.debug(f"   ผลการติดตั้ง tqdm: ...{process.stdout[-200:]}")
-        from tqdm.notebook import tqdm
-        logging.info("   (Success) ติดตั้ง tqdm สำเร็จ.")
-    except Exception as e_install:
-        logging.error(f"   (Error) ไม่สามารถติดตั้ง tqdm: {e_install}", exc_info=True)
-        tqdm = None # Set tqdm to None if installation fails
+    if AUTO_INSTALL_LIBS:
+        logging.info("   กำลังติดตั้งไลบรารี tqdm...")
+        try:
+            process = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "tqdm", "-q"],
+                check=True, capture_output=True, text=True,
+            )
+            logging.debug(f"   ผลการติดตั้ง tqdm: ...{process.stdout[-200:]}")
+            from tqdm.notebook import tqdm
+            logging.info("   (Success) ติดตั้ง tqdm สำเร็จ.")
+        except Exception as e_install:
+            logging.error(f"   (Error) ไม่สามารถติดตั้ง tqdm: {e_install}", exc_info=True)
+            tqdm = None
+    else:
+        logging.error("ไลบรารี 'tqdm' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        tqdm = None
 
 # [Patch v4.8.12] Ensure TA library is installed once then record version
 TA_VERSION = "N/A"
 
 # [Patch v5.0.2] Exclude TA auto-install from coverage
 def _ensure_ta_installed():  # pragma: no cover
-    """Install `ta` library if missing and store its version."""
+    """Ensure `ta` library is available and record its version."""
     global ta, TA_VERSION
     try:
         import ta  # noqa: F401
     except ImportError:
-        logging.info("(Info) ไลบรารี 'ta' ไม่พบ กำลังติดตั้งอัตโนมัติ...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "ta"])
-        except Exception as e_install:
-            logging.warning(f"(Warning) ติดตั้งไลบรารี ta ไม่สำเร็จ: {e_install}")
+        if AUTO_INSTALL_LIBS:
+            logging.info("(Info) ไลบรารี 'ta' ไม่พบ กำลังติดตั้งอัตโนมัติ...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "ta"])
+                importlib.invalidate_caches()
+                import ta as _ta
+            except Exception as e_install:
+                logging.warning(f"(Warning) ติดตั้งไลบรารี ta ไม่สำเร็จ: {e_install}")
+                TA_VERSION = None
+                return
+            ta = _ta
+        else:
+            logging.error("ไลบรารี 'ta' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+            TA_VERSION = None
             return
-        importlib.invalidate_caches()
-        import ta
     TA_VERSION = getattr(ta, "__version__", "N/A")
     globals()["ta"] = ta
     log_library_version("TA", ta)
@@ -132,20 +167,27 @@ try:
     # Consider setting verbosity later if needed
     # optuna.logging.set_verbosity(optuna.logging.WARNING)
 except ImportError:
-    logging.info("   กำลังติดตั้งไลบรารี optuna...")
-    try:
-        process = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "optuna", "-q"],
-            check=True, capture_output=True, text=True,
-        )
-        logging.debug(f"   ผลการติดตั้ง optuna: ...{process.stdout[-200:]}")
-        import optuna
-        logging.info("   (Success) ติดตั้ง optuna สำเร็จ.")
-        log_library_version("Optuna", optuna)
-        # optuna.logging.set_verbosity(optuna.logging.WARNING)
-    except Exception as e_install:
-        logging.error(f"   (Error) ไม่สามารถติดตั้ง optuna: {e_install}. Hyperparameter Optimization จะไม่ทำงาน.", exc_info=True)
-        optuna = None # Set optuna to None if installation fails
+    if AUTO_INSTALL_LIBS:
+        logging.info("   กำลังติดตั้งไลบรารี optuna...")
+        try:
+            process = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "optuna", "-q"],
+                check=True, capture_output=True, text=True,
+            )
+            logging.debug(f"   ผลการติดตั้ง optuna: ...{process.stdout[-200:]}")
+            import optuna
+            logging.info("   (Success) ติดตั้ง optuna สำเร็จ.")
+            log_library_version("Optuna", optuna)
+            # optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except Exception as e_install:
+            logging.error(
+                f"   (Error) ไม่สามารถติดตั้ง optuna: {e_install}. Hyperparameter Optimization จะไม่ทำงาน.",
+                exc_info=True,
+            )
+            optuna = None
+    else:
+        logging.error("ไลบรารี 'optuna' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        optuna = None
 # pragma: cover
 
 # XGBoost (Removed in v3.6.6)
@@ -165,27 +207,44 @@ try:
     except Exception as e_cb_gpu_check:
         logging.warning(f"   (Warning) ไม่สามารถตรวจสอบจำนวน GPU ของ CatBoost: {e_cb_gpu_check}")
 except ImportError:
-    logging.info("   กำลังติดตั้งไลบรารี catboost...")
-    try:
-        install_command = [sys.executable, "-m", "pip", "install", "catboost", "-q"]
-        process = subprocess.run(
-            install_command,
-            check=True, capture_output=True, text=True,
-        )
-        logging.debug(f"   ผลการติดตั้ง catboost: ...{process.stdout[-200:]}")
-        import catboost
-        from catboost import CatBoostClassifier, Pool
-        logging.info(f"   (Success) ติดตั้ง catboost สำเร็จ (เวอร์ชัน: {catboost.__version__}).")
+    if AUTO_INSTALL_LIBS:
+        logging.info("   กำลังติดตั้งไลบรารี catboost...")
         try:
-            from catboost.utils import get_gpu_device_count
-            gpu_count_post = get_gpu_device_count()
-            logging.info(f"   (Info) ตรวจสอบจำนวน GPU สำหรับ CatBoost (หลังติดตั้ง): {gpu_count_post}")
-        except Exception as e_cb_gpu_check_post:
-            logging.warning(f"   (Warning) ไม่สามารถตรวจสอบจำนวน GPU ของ CatBoost (หลังติดตั้ง): {e_cb_gpu_check_post}")
+            install_command = [sys.executable, "-m", "pip", "install", "catboost", "-q"]
+            process = subprocess.run(
+                install_command,
+                check=True, capture_output=True, text=True,
+            )
+            logging.debug(f"   ผลการติดตั้ง catboost: ...{process.stdout[-200:]}")
+            import catboost
+            from catboost import CatBoostClassifier, Pool
+            logging.info(
+                f"   (Success) ติดตั้ง catboost สำเร็จ (เวอร์ชัน: {catboost.__version__})."
+            )
+            try:
+                from catboost.utils import get_gpu_device_count
+                gpu_count_post = get_gpu_device_count()
+                logging.info(
+                    f"   (Info) ตรวจสอบจำนวน GPU สำหรับ CatBoost (หลังติดตั้ง): {gpu_count_post}"
+                )
+            except Exception as e_cb_gpu_check_post:
+                logging.warning(
+                    f"   (Warning) ไม่สามารถตรวจสอบจำนวน GPU ของ CatBoost (หลังติดตั้ง): {e_cb_gpu_check_post}"
+                )
+        except Exception as e_cat_install:
+            logging.error(
+                f"   (Error) ไม่สามารถติดตั้ง catboost: {e_cat_install}. CatBoost models และ SHAP อาจไม่ทำงาน.",
+                exc_info=True,
+            )
+            CatBoostClassifier = None
+            Pool = None
+            catboost = None
+    else:
+        logging.error("ไลบรารี 'catboost' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        CatBoostClassifier = None
+        Pool = None
+        catboost = None
 # pragma: cover
-    except Exception as e_cat_install:
-        logging.error(f"   (Error) ไม่สามารถติดตั้ง catboost: {e_cat_install}. CatBoost models และ SHAP อาจไม่ทำงาน.", exc_info=True)
-        CatBoostClassifier = None; Pool = None; catboost = None
 
 # psutil library
 # pragma: no cover
@@ -194,24 +253,63 @@ try:
     logging.debug("psutil library already installed.")
     log_library_version("psutil", psutil)
 except ImportError:
-    logging.info("   กำลังติดตั้ง psutil สำหรับตรวจสอบ RAM...")
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "psutil", "-q"], check=True)
-        import psutil
-        logging.info("   (Success) ติดตั้ง psutil สำเร็จ.")
-        log_library_version("psutil", psutil)
-    except Exception as e_install:
-        logging.error(f"   (Error) ไม่สามารถติดตั้ง psutil: {e_install}", exc_info=True)
+    if AUTO_INSTALL_LIBS:
+        logging.info("   กำลังติดตั้ง psutil สำหรับตรวจสอบ RAM...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "psutil", "-q"], check=True)
+            import psutil
+            logging.info("   (Success) ติดตั้ง psutil สำเร็จ.")
+            log_library_version("psutil", psutil)
+        except Exception as e_install:
+            logging.error(f"   (Error) ไม่สามารถติดตั้ง psutil: {e_install}", exc_info=True)
+            psutil = None
+    else:
+        logging.error("ไลบรารี 'psutil' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
         psutil = None
 # pragma: cover
 
 # SHAP library
 # pragma: no cover
+SHAP_INSTALLED = False
+SHAP_AVAILABLE = False
 try:
     import shap
+    SHAP_INSTALLED = True
+    SHAP_AVAILABLE = True
     logging.debug("shap library already installed.")
     log_library_version("SHAP", shap)
 except ImportError:
+    if AUTO_INSTALL_LIBS:
+        logging.info("   กำลังติดตั้งไลบรารี shap...")
+        try:
+            logging.info("      (การติดตั้ง SHAP อาจใช้เวลาสักครู่...)")
+            process = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "shap", "-q"],
+                check=True, capture_output=True, text=True,
+            )
+            logging.debug(f"   ผลการติดตั้ง shap: ...{process.stdout[-200:]}")
+            import shap
+            SHAP_INSTALLED = True
+            SHAP_AVAILABLE = True
+            logging.info("   (Success) ติดตั้ง shap สำเร็จ.")
+            log_library_version("SHAP", shap)
+        except Exception as e_shap_install:
+            logging.error(
+                f"   (Error) ไม่สามารถติดตั้ง shap: {e_shap_install}. การวิเคราะห์ SHAP จะถูกข้ามไป.",
+                exc_info=True,
+            )
+        shap = None
+    else:
+        logging.error("ไลบรารี 'shap' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        shap = None
+# pragma: cover
+
+
+def install_shap():
+    """Install the shap library if not already available."""
+    global SHAP_INSTALLED, SHAP_AVAILABLE, shap
+    if SHAP_INSTALLED:
+        return
     logging.info("   กำลังติดตั้งไลบรารี shap...")
     try:
         logging.info("      (การติดตั้ง SHAP อาจใช้เวลาสักครู่...)")
@@ -221,12 +319,16 @@ except ImportError:
         )
         logging.debug(f"   ผลการติดตั้ง shap: ...{process.stdout[-200:]}")
         import shap
+        SHAP_INSTALLED = True
+        SHAP_AVAILABLE = True
         logging.info("   (Success) ติดตั้ง shap สำเร็จ.")
         log_library_version("SHAP", shap)
     except Exception as e_shap_install:
-        logging.error(f"   (Error) ไม่สามารถติดตั้ง shap: {e_shap_install}. การวิเคราะห์ SHAP จะถูกข้ามไป.", exc_info=True)
+        logging.error(
+            f"   (Error) ไม่สามารถติดตั้ง shap: {e_shap_install}. การวิเคราะห์ SHAP จะถูกข้ามไป.",
+            exc_info=True,
+        )
         shap = None
-# pragma: cover
 
 # GPUtil library (Optional for Resource Monitor)
 # pragma: no cover
@@ -234,18 +336,25 @@ try:
     import GPUtil
     logging.debug("GPUtil library already installed.")
 except ImportError:
-    logging.info("   กำลังติดตั้ง GPUtil สำหรับตรวจสอบ GPU (Optional)...")
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "gputil", "-q"], check=True)
-        import GPUtil
-        logging.info("   (Success) ติดตั้ง GPUtil สำเร็จ.")
-    except Exception as e_install:
-        logging.warning(f"   (Warning) ไม่สามารถติดตั้ง GPUtil: {e_install}. ฟังก์ชัน show_system_status อาจไม่ทำงาน.")
+    if AUTO_INSTALL_LIBS:
+        logging.info("   กำลังติดตั้ง GPUtil สำหรับตรวจสอบ GPU (Optional)...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "gputil", "-q"], check=True)
+            import GPUtil
+            logging.info("   (Success) ติดตั้ง GPUtil สำเร็จ.")
+        except Exception as e_install:
+            logging.warning(
+                f"   (Warning) ไม่สามารถติดตั้ง GPUtil: {e_install}. ฟังก์ชัน show_system_status อาจไม่ทำงาน."
+            )
+            GPUtil = None
+    else:
+        logging.warning("ไลบรารี 'GPUtil' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
         GPUtil = None
 # pragma: cover
 
 # --- Colab/Drive Setup ---
 def is_colab():
+    """Return True if running within Google Colab."""  # [Patch v5.3.3]
     try:
         import google.colab  # noqa: F401
         return True
@@ -276,7 +385,7 @@ DEFAULT_LOG_DIR = os.path.join(FILE_BASE, "logs")
 
 # --- GPU Acceleration Setup (Optional) ---
 # pragma: no cover
-USE_GPU_ACCELERATION = True
+USE_GPU_ACCELERATION = os.getenv("USE_GPU_ACCELERATION", "True").lower() in ("true", "1", "yes")
 cudf = None; cuml = None; cuStandardScaler = None; pynvml = None; nvml_handle = None
 logging.info("   (Checking) กำลังตรวจสอบความพร้อมใช้งาน GPU...")
 try:
@@ -296,8 +405,10 @@ try:
             logging.error(f"   (Warning) ข้อผิดพลาด NVML: {e_nvml}.", exc_info=True)
             pynvml = None
             if nvml_handle:
-                try: pynvml.nvmlShutdown()
-                except: pass
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
                 nvml_handle = None
     else:
         logging.info("   (Info) PyTorch ไม่พบ GPU. การเร่งความเร็วด้วย GPU จะถูกปิด.")
@@ -308,8 +419,10 @@ except ImportError:
 except Exception as e_gpu:
     logging.error(f"   (Error) การตั้งค่า GPU ล้มเหลว: {e_gpu}", exc_info=True)
     if pynvml and nvml_handle:
-        try: pynvml.nvmlShutdown()
-        except: pass
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
         nvml_handle = None
     USE_GPU_ACCELERATION = False
 logging.info(f"   สถานะการเร่งความเร็วด้วย GPU: {USE_GPU_ACCELERATION}")
@@ -329,17 +442,25 @@ def print_gpu_utilization(context=""):  # pragma: no cover
             gpu_util_str = f"{info.gpu}%"
             gpu_mem_str = f"{info.memory}% ({mem_info.used // 1024**2}MB / {mem_info.total // 1024**2}MB)"
         except pynvml.NVMLError as e_gpu_mon:
-            gpu_util_str = "NVML Err"; gpu_mem_str = f"NVML Err: {e_gpu_mon}"
+            gpu_util_str = "NVML Err"
+            gpu_mem_str = f"NVML Err: {e_gpu_mon}"
             logging.warning(f"NVML Error during GPU monitoring: {e_gpu_mon}. Disabling pynvml monitoring.")
-            try: pynvml.nvmlShutdown()
-            except: pass
+            if pynvml:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
             nvml_handle = None
             pynvml = None
         except Exception as e_gpu_mon_other:
-            gpu_util_str = "Err"; gpu_mem_str = f"Err: {e_gpu_mon_other}"
-            logging.error(f"Unexpected error during GPU monitoring: {e_gpu_mon_other}", exc_info=True)
-            try: pynvml.nvmlShutdown()
-            except: pass
+            gpu_util_str = "Err"
+            gpu_mem_str = f"Err: {e_gpu_mon_other}"
+            logging.warning(f"Unexpected error retrieving GPU stats: {e_gpu_mon_other}.")
+            if pynvml:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
             nvml_handle = None
             pynvml = None
     elif USE_GPU_ACCELERATION and not pynvml:
@@ -349,13 +470,13 @@ def print_gpu_utilization(context=""):  # pragma: no cover
 
     if psutil:
         try:
-            ram_info = psutil.virtual_memory()
-            ram_str = f"{ram_info.percent:.1f}% ({ram_info.used // 1024**2}MB / {ram_info.total // 1024**2}MB)"
-        except Exception as e_ram_mon:
-            ram_str = f"Error: {e_ram_mon}"
-            logging.error(f"Error getting RAM info: {e_ram_mon}", exc_info=True)
+            mem = psutil.virtual_memory()
+            ram_str = f"{mem.percent}% ({mem.used // 1024**2}MB / {mem.total // 1024**2}MB)"
+        except Exception as e_mem:
+            ram_str = "N/A"
+            logging.warning(f"Unable to retrieve RAM stats: {e_mem}.")
     else:
-        ram_str = "psutil N/A"
+        ram_str = "psutil not installed"
 
     logging.info(f"[{context}] GPU Util: {gpu_util_str} | Mem: {gpu_mem_str} | RAM: {ram_str}")
 
@@ -404,7 +525,7 @@ logging.debug("Global warnings filtered and pandas options set.")
 # ==============================================================================
 logging.info("Loading Global Configuration Settings...")
 OUTPUT_BASE_DIR = DEFAULT_LOG_DIR
-OUTPUT_DIR_NAME = "outputgpt_v4.8.4"
+OUTPUT_DIR_NAME = f"outputgpt_v{__version__}"
 DATA_FILE_PATH_M15 = DEFAULT_CSV_PATH_M15
 DATA_FILE_PATH_M1 = DEFAULT_CSV_PATH_M1
 TRAIN_META_MODEL_BEFORE_RUN = True

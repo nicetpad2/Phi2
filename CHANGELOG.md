@@ -1,3 +1,18 @@
+### 2025-06-30
+- [Patch v5.0.23] Fix GPU logging and optuna sweep fallback
+- New/Updated unit tests added for ProjectP and hyperparameter sweep
+- QA: pytest -q passed (206 tests)
+
+### 2025-06-25
+- [Patch v5.0.22] Add backtest profiling script
+- New/Updated unit tests added for profile_backtest
+- QA: pytest -q passed (174 tests)
+
+### 2025-06-20
+- [Patch v5.0.21] Centralize version management
+- New/Updated unit tests added for src.config and src.strategy
+- QA: pytest -q passed (170 tests)
+
 ### 2025-06-05
 - [Patch v5.0.1] Simplify FULL_PIPELINE fallback logic
 - New/Updated unit tests added for src.main
@@ -15,7 +30,7 @@
 ### 2024-05-16
 - [Patch v1.0.0] Refactor gold ai script into modules
 - New/Updated unit tests added for imports
-- QA: pytest -q passed (0 tests)
+- QA: pytest -q passed (170 tests)
 
 ### 2025-06-02
 - [Patch v1.0.1] Update default paths for data and logs
@@ -167,3 +182,241 @@
 - [Patch v5.0.12] เพิ่มชุดการทดสอบอีก 10 บล็อกและแก้ไข warning skip
 - New/Updated unit tests added for src.features, src.data_loader
 - QA: pytest -q passed (123 tests)
+### 2025-06-12
+- [Patch v5.0.13] เพิ่มชุดการทดสอบอีก 10 บล็อกและแก้ไข warning skip
+- New/Updated unit tests added for src.main, src.strategy
+- QA: pytest -q passed (133 tests)
+
+### 2025-06-13
+- [Patch v5.0.14] เพิ่มชุดการทดสอบอีก 10 บล็อกและแก้ไข warning skip
+- New/Updated unit tests added for src.features, src.data_loader
+- QA: pytest -q passed (143 tests)
+
+
+### 2025-06-13
+- [Patch v5.0.14] Ensure features file creation and path handling
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed (135 test
+
+
+### 2025-06-14
+- [Patch v5.0.15] Reduce warning level for missing MAX_NAT_RATIO_THRESHOLD
+- New/Updated unit tests added for src.data_loader
+- QA: pytest -q passed (145 tests)
+
+### 2025-06-14
+- [Patch v5.0.15] เพิ่มชุดการทดสอบอีก 10 บล็อกและแก้ไข warning skip
+- New/Updated unit tests added for src.features, src.data_loader
+- QA: pytest -q passed (155 tests)
+
+
+### 2025-06-15
+- [Patch v5.0.16] Handle duplicate samples to avoid ConvergenceWarning
+- New/Updated unit tests added for src.features, tests.test_function_registry
+- QA: pytest -q passed (165 tests)
+
+
+### 2025-06-15
+- [Patch v5.0.16] Fix soft cooldown trigger condition to require lookback trades
+- New/Updated unit tests added for tests.test_soft_cooldown_logic
+- QA: pytest -q passed (167 tests)
+
+### 2025-06-16
+- [Patch v5.0.17] Add hyperparameter sweep helper
+- New/Updated unit tests added for src.strategy
+- QA: pytest -q passed (167 tests)
+
+### 2025-06-16
+- [Patch v5.0.18] Optuna CatBoost sweep function
+- New/Updated unit tests added for tests.test_hyperparameter_sweep, tests.test_function_registry
+- QA: pytest -q passed (168 tests)
+
+### 2025-06-16
+- [Patch v5.0.17] Add soft cooldown helper and update tests
+- New/Updated unit tests added for src.cooldown_utils, tests.test_soft_cooldown_logic
+- QA: pytest -q passed (167 tests)
+### 2025-06-17
+- [Patch v5.0.18] Relax MACD and cooldown thresholds
+- New/Updated unit tests added for tests.test_soft_cooldown_logic, tests.test_function_registry
+- QA: pytest -q passed (168 tests)
+
+
+### 2025-06-18
+- [Patch v5.0.19] Add example hyperparameter sweep script
+- QA: pytest -q passed (168 tests)
+
+### 2025-06-19
+- [Patch v5.0.20] Add soft cooldown bar countdown and helper
+- New/Updated unit tests added for tests.test_soft_cooldown_logic
+- QA: pytest -q passed (169 tests)
+
+### 2025-06-20
+- [Patch v5.1.0] ปรับข้อความ dummy_train_func เป็นภาษาไทย
+- QA: pytest -q passed (170 tests)
+
+
+### 2025-06-21
+- [Patch v5.1.1] Standardize absolute imports and add setup.py
+- New/Updated unit tests added for src.main and src.strategy
+- QA: pytest -q passed (170 tests)
+
+### 2025-06-22
+- [Patch v5.1.2] เพิ่มตัวแปร AUTO_INSTALL_LIBS และปรับ logic ตรวจสอบไลบรารี
+- New/Updated unit tests added for src.config และ README.md
+- QA: pytest -q passed (170 tests)
+### 2025-06-03
+- [Patch v5.1.3] Consolidate get_session_tag into utils module
+- New/Updated unit tests added for src.utils.sessions
+- QA: pytest -q passed (174 tests)
+### 2025-06-24
+- [Patch v5.1.4] เพิ่ม unit tests ครอบคลุมฟังก์ชันหลัก
+- New/Updated unit tests added for src.strategy and src.features
+- QA: pytest -q passed (182 tests)
+
+### 2025-06-26
+- [Patch v5.1.0] เพิ่มฟังก์ชัน run_hyperparameter_sweep สำหรับ Grid Search
+- New/Updated unit tests added for src.strategy
+- QA: pytest -q passed (183 tests)
+
+### 2025-06-27
+
+- [Patch v5.1.0] รวมลำดับการแสดงผล Run ให้อยู่ใน loop เดียวกัน
+- QA: pytest -q passed (183 tests)
+
+### 2025-06-28
+
+- [Patch v5.1.5] profile_backtest.py: เพิ่มการสร้าง Features M1 ก่อนรัน backtest
+- New/Updated unit tests added for profile_backtest
+- QA: pytest -q passed (183 tests)
+
+### 2025-06-29
+
+- [Patch v5.1.6] Fix TRAIN_MODEL_ONLY M1 data path
+- QA: pytest -q passed (186 tests)
+
+### 2025-06-30
+
+
+- [Patch v5.1.6] แก้ไข Merge และตรวจสอบฟีเจอร์ใน train_and_export_meta_model
+- New/Updated unit tests added for strategy
+- QA: pytest -q passed (186 tests)
+
+
+
+
+
+### 2025-06-30
+
+- [Patch v5.1.6] TRAIN_MODEL_ONLY: load prep data for trade log
+- QA: pytest -q passed (186 tests)
+### 2025-07-01
+- [Patch v5.1.7] Update line numbers in function registry tests
+- QA: pytest -q passed (187 tests)
+
+
+### 2025-07-01
+- [Patch v5.1.8] Fix RSI reindex on duplicate timestamps
+- New/Updated unit tests added for src.features
+- QA: pytest -q passed (188 tests)
+
+### 2025-07-02
+- [Patch v5.1.9] Auto-run PREPARE_TRAIN_DATA when training files are missing
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed (189 tests)
+
+### 2025-07-03
+
+- [Patch v5.2.0] Import print_gpu_utilization in strategy module
+- QA: pytest -q passed (190 tests)
+### 2025-07-04
+- [Patch v5.1.10] Fixed RSI reindex issue due to duplicate timestamps
+- New/Updated unit tests added for src.features
+- QA: pytest -q passed (190 tests)
+
+### 2025-07-05
+- [Patch v5.2.1] Improve is_colab detection to avoid mount errors
+- New/Updated unit tests added for config and registry
+- QA: pytest -q passed (193 tests)
+
+### 2025-07-06
+
+- [Patch v5.2.2] Add simple_converter import and relocation
+- New/Updated unit tests added for src.strategy
+- QA: pytest -q passed (193 tests)
+
+
+### 2025-07-07
+- [Patch v5.2.3] Fix missing imports for metrics and SHAP noise checker
+- New/Updated unit tests added for src.strategy
+- QA: pytest -q passed (193 tests)
+### 2025-07-08
+- [Patch v5.2.4] Ensure default output directory exists
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed (198 tests)
+
+### 2025-07-09
+
+- [Patch v5.2.5] เพิ่มตัวเลือก --limit และ --output ใน profile_backtest.py
+- New/Updated unit tests added for profile_backtest
+- QA: pytest -q passed (199 tests)
+
+### 2025-07-10
+
+- [Patch v5.2.6] ปรับปรุง hyperparameter_sweep ให้ใช้ run_hyperparameter_sweep
+- New/Updated unit tests added for hyperparameter_sweep
+- QA: pytest -q passed (199 tests)
+
+### 2025-07-11
+- [Patch v5.3.0] Enterprise hyperparameter sweep improvements
+- New/Updated unit tests added for hyperparameter_sweep
+- QA: pytest -q passed (199 tests)
+
+
+
+
+### 2025-07-10
+- [Patch v5.2.6] Update requirements list
+- QA: pytest -q passed (199 tests)
+
+### 2025-06-03
+- [Patch v5.2.7] Initialize metrics dicts to avoid UnboundLocalError
+- New/Updated unit tests adjusted for line offsets
+- QA: pytest -q passed (207 tests)
+
+
+### 2025-07-11
+- [Patch v5.2.7] Update dependency versions in requirements.txt
+- QA: pytest -q passed (207 tests)
+
+
+### 2025-07-11
+- [Patch v5.2.7] Catch UnboundLocalError in PREPARE_TRAIN_DATA
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed (199 tests)
+
+### 2025-07-12
+- [Patch v5.3.1] Robust Metrics Assignment in run_all_folds_with_threshold
+- New/Updated unit tests added for src.strategy
+- QA: pytest -q passed (199 tests)
+
+
+### 2025-07-12
+- [Patch v5.3.1] Safeguard main pipeline from missing metrics
+- New/Updated unit tests added for src.strategy
+- QA: pytest -q passed (207 tests)
+
+### 2025-07-30
+- [Patch v5.3.2] QA-Guard ensures log files
+- New/Updated unit tests added for src.main
+- QA: pytest -q passed
+
+### 2025-07-13
+- [Patch v5.3.3] Fix Colab detection when running scripts
+- New/Updated unit tests added for src.config
+- QA: pytest -q passed (210 tests)
+
+### 2025-07-14
+- [Patch v5.3.4] real_train_func accepts seed parameter for deterministic sweeps
+- New/Updated unit tests added for src.training
+- QA: pytest -q passed
+

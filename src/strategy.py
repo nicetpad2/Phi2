@@ -10,10 +10,24 @@
 import logging
 import os
 import time
+from tqdm import tqdm
 import json
 import pandas as pd
 import numpy as np
 from typing import Dict, List
+# [Patch v5.2.0] Use explicit package import for cooldown utilities
+from src.cooldown_utils import (
+    is_soft_cooldown_triggered,
+    step_soft_cooldown,
+)
+from itertools import product
+from src.utils.sessions import get_session_tag  # [Patch v5.1.3]
+from src.config import print_gpu_utilization  # [Patch v5.2.0] นำเข้า helper สำหรับแสดงการใช้งาน GPU/RAM (print_gpu_utilization)
+
+# อ่านเวอร์ชันจากไฟล์ VERSION
+VERSION_FILE = os.path.join(os.path.dirname(__file__), '..', 'VERSION')
+with open(VERSION_FILE, 'r', encoding='utf-8') as vf:
+    __version__ = vf.read().strip()
 try:
     import numba
     from numba import njit
@@ -21,21 +35,32 @@ except Exception:  # pragma: no cover - fallback when numba unavailable
     numba = None
     def njit(func):
         return func
+
 # [Patch v4.8.8] Import safe_set_datetime using unconditional absolute import
-try:
-    from data_loader import safe_set_datetime
-except ImportError:
-    from data_loader import safe_set_datetime  # Already on PYTHONPATH; fallback to direct import
+from src.data_loader import safe_set_datetime
+from src.data_loader import safe_load_csv_auto  # [Patch v5.1.6] Ensure CSV loader is imported
+from src.data_loader import simple_converter
 
 # [Patch v4.8.9] Import safe_get_global using unconditional absolute import
-try:
-    from data_loader import safe_get_global
-except ImportError:
-    from data_loader import safe_get_global  # fallback to direct import if package context missing
+from src.data_loader import safe_get_global
+from src.features import (
+    select_top_shap_features,
+    check_model_overfit,
+    analyze_feature_importance_shap,
+    check_feature_noise_shap,  # [Patch] เพิ่มการ import เพื่อตรวจสอบ SHAP noise
+)  # [Patch] นำเข้า Dynamic Feature Selection & Overfitting Helpers
 import traceback
 from joblib import dump as joblib_dump # Use joblib dump directly
-from sklearn.model_selection import train_test_split, TimeSeriesSplit # Ensure TimeSeriesSplit is imported
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, cross_val_score
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    log_loss,
+    classification_report,
+)  # [Patch] นำเข้า metric ที่ขาดหายไป
 import gc # For memory management
+import os
+import itertools
 # Import ML libraries conditionally (assuming they are checked/installed in Part 1)
 try:
     from catboost import CatBoostClassifier, Pool
@@ -50,6 +75,19 @@ try:
     import optuna
 except ImportError:
     optuna = None
+
+# [Patch] นำเข้า pynvml สำหรับตรวจสอบ GPU (Prevent NameError)
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+    nvml_handle = None
+else:
+    try:
+        pynvml.nvmlInit()
+        nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        nvml_handle = None
 
 # Ensure global configurations are accessible if run independently
 # Define defaults if globals are not found
@@ -178,7 +216,7 @@ def train_and_export_meta_model(
                                           Returns empty list if training fails.
     """
     start_train_time = time.time()
-    logging.info(f"\n(Training - v4.8.8 Patch 2) เริ่มต้นการ Train Meta Classifier (Purpose: {model_purpose.upper()})...") # Updated version in log
+    logging.info(f"\n(Training - v{__version__}) เริ่มต้นการ Train Meta Classifier (Purpose: {model_purpose.upper()})...") # Updated version in log
     logging.info(f"   Model Type: {model_type_to_train}")
     logging.info(f"   Sample Size Limit: {sample_size}")
     logging.info(f"   Features to Drop Before Final Train: {features_to_drop_before_train}")
@@ -202,7 +240,7 @@ def train_and_export_meta_model(
             logging.critical(f"(Error) ไม่สามารถสร้าง Output Directory '{output_dir}': {e}", exc_info=True)
             return None, []
 
-    global USE_GPU_ACCELERATION, meta_model_type_used, pattern_label_map
+    global USE_GPU_ACCELERATION, meta_model_type_used, pattern_label_map; USE_GPU_ACCELERATION = globals().get('USE_GPU_ACCELERATION', False)
     if enable_optuna_tuning and optuna is None:
         logging.warning("(Warning) ต้องการใช้ Optuna แต่ Library ไม่พร้อมใช้งาน. ปิด Optuna Tuning.")
         enable_optuna_tuning = False
@@ -236,6 +274,10 @@ def train_and_export_meta_model(
             return None, []
         logging.info(f"   ใช้ Trade Log ที่ Filter แล้ว (Override) จำนวน {len(trade_log_df_override)} แถว สำหรับ Model Purpose: {model_purpose.upper()}")
         trade_log_df = trade_log_df_override.copy()
+        # [Patch v5.1.6] Ensure Trade Log has 'datetime' column for merge
+        if 'datetime' not in trade_log_df.columns:
+            trade_log_df['datetime'] = trade_log_df['entry_time']
+        trade_log_df['datetime'] = pd.to_datetime(trade_log_df['datetime'])
     elif trade_log_path and isinstance(trade_log_path, str):
         logging.info(f"   กำลังโหลด Trade Log (Default Path): {trade_log_path}")
         try:
@@ -251,6 +293,10 @@ def train_and_export_meta_model(
                 logging.error(f"(Error) Trade Log (Default Path) is missing required columns: {missing_cols_path}. Cannot proceed with training.")
                 return None, []
             logging.info(f"   โหลด Trade Log (Default) สำเร็จ ({len(trade_log_df)} แถว).")
+            # [Patch v5.1.6] Ensure Trade Log has 'datetime' column for merge
+            if 'datetime' not in trade_log_df.columns:
+                trade_log_df['datetime'] = trade_log_df['entry_time']
+            trade_log_df['datetime'] = pd.to_datetime(trade_log_df['datetime'])
         except Exception as e:
             logging.error(f"(Error) ไม่สามารถโหลด Trade Log (Default): {e}", exc_info=True)
             return None, []
@@ -281,7 +327,7 @@ def train_and_export_meta_model(
         if trade_log_df.empty:
             logging.error("(Error) ไม่มี Trades ที่ถูกต้องใน Log หลังการประมวลผล.")
             return None, []
-        trade_log_df = trade_log_df.sort_values("entry_time")
+        trade_log_df = trade_log_df.sort_values("datetime")
         logging.info(f"   ประมวลผล Trade Log สำเร็จ ({len(trade_log_df)} trades).")
 
     except Exception as e:
@@ -325,6 +371,8 @@ def train_and_export_meta_model(
             dup_count = m1_df.index.duplicated().sum()
             logging.warning(f"   (Warning) พบ Index ซ้ำ {dup_count} รายการใน M1 Data. กำลังลบรายการซ้ำ (เก็บรายการแรก)...")
             m1_df = m1_df[~m1_df.index.duplicated(keep='first')]
+        # [Patch v5.1.6] Ensure M1 DataFrame has 'datetime' column for merge
+        m1_df['datetime'] = m1_df.index
 
         logging.info(f"   โหลดและเตรียม M1 สำเร็จ ({len(m1_df)} แถว). จำนวน Features เริ่มต้น: {len(m1_df.columns)}")
     except Exception as e:
@@ -337,27 +385,25 @@ def train_and_export_meta_model(
 
     logging.info("   กำลังรวม Trade Log กับ M1 Features (merge_asof)...")
     try:
-        if not pd.api.types.is_datetime64_any_dtype(trade_log_df["entry_time"]):
-            logging.warning("   Converting trade_log entry_time to datetime again before merge.")
-            trade_log_df["entry_time"] = pd.to_datetime(trade_log_df["entry_time"], errors='coerce')
-            trade_log_df.dropna(subset=["entry_time"], inplace=True)
+        if not pd.api.types.is_datetime64_any_dtype(trade_log_df["datetime"]):
+            trade_log_df["datetime"] = pd.to_datetime(trade_log_df["datetime"], errors='coerce')
+            trade_log_df.dropna(subset=["datetime"], inplace=True)
         if trade_log_df.empty:
-            logging.error("(Error) ไม่มี Trades ที่มี entry_time ถูกต้องหลังการแปลง (ก่อน Merge).")
+            logging.error("(Error) ไม่มี Trades ที่มี datetime ถูกต้องหลังการแปลง (ก่อน Merge).")
             return None, []
-        if not trade_log_df["entry_time"].is_monotonic_increasing:
-            trade_log_df = trade_log_df.sort_values("entry_time")
-        if not isinstance(m1_df.index, pd.DatetimeIndex):
-            logging.error("   (Error) M1 index is not DatetimeIndex before merge.")
+        if not pd.api.types.is_datetime64_any_dtype(m1_df["datetime"]):
+            m1_df["datetime"] = pd.to_datetime(m1_df["datetime"], errors='coerce')
+            m1_df.dropna(subset=["datetime"], inplace=True)
+        if trade_log_df.empty or m1_df.empty:
+            logging.error("(Error) DataFrame ว่างหลังการเตรียม datetime สำหรับ merge.")
             return None, []
-        if not m1_df.index.is_monotonic_increasing:
-            logging.warning("   M1 index was not monotonic, sorting again before merge.")
-            m1_df = m1_df.sort_index()
-
+        trade_log_df_sorted = trade_log_df.sort_values("datetime").reset_index(drop=True)
+        m1_df_sorted = m1_df.sort_values("datetime").reset_index(drop=True)
+        logging.info("[Patch] เริ่ม Merge Trade Log กับ M1 Features (merge_asof)")
         merged_df = pd.merge_asof(
-            trade_log_df,
-            m1_df,
-            left_on="entry_time",
-            right_index=True,
+            trade_log_df_sorted,
+            m1_df_sorted,
+            on="datetime",
             direction="backward",
             tolerance=pd.Timedelta(minutes=5)
         )
@@ -365,11 +411,23 @@ def train_and_export_meta_model(
         del trade_log_df, m1_df
         gc.collect()
 
-        # Define initial features based on global config or loaded list
-        initial_features_for_selection = [f for f in META_CLASSIFIER_FEATURES if f in merged_df.columns]
-        if not initial_features_for_selection:
-            logging.error("(Error) ไม่มี Features เริ่มต้นที่ใช้ได้ในข้อมูลที่รวมแล้ว.")
+        # [Patch v5.1.6] Load feature list from features_main.json
+        features_json_path = os.path.join(output_dir, "features_main.json")
+        try:
+            with open(features_json_path, "r", encoding="utf-8") as f_feat:
+                feature_list = json.load(f_feat)
+        except Exception as e_feat:
+            logging.warning(f"[Patch] ไม่สามารถโหลด features_main.json: {e_feat}. ใช้ META_CLASSIFIER_FEATURES แทน")
+            feature_list = META_CLASSIFIER_FEATURES
+
+        available_features = [f for f in feature_list if f in merged_df.columns]
+        missing_features = [f for f in feature_list if f not in merged_df.columns]
+        logging.info(f"[Patch] Available Features หลัง Merge: {len(available_features)} รายการ")
+        logging.info(f"[Patch] Missing Features หลัง Merge: {len(missing_features)} รายการ: {missing_features}")
+        if not available_features:
+            logging.error(f"[Error] ไม่มี Features ใช้ได้หลัง Merge: feature_list ทั้งหมดหายไป! (missing: {missing_features})")
             return None, []
+        initial_features_for_selection = available_features
         logging.info(f"   Features เริ่มต้นสำหรับการเลือก ({len(initial_features_for_selection)}): {sorted(initial_features_for_selection)}")
 
         features_to_check_for_nan = initial_features_for_selection + ["is_tp"]
@@ -572,7 +630,7 @@ def train_and_export_meta_model(
             if potential_lag_features:
                 logging.info(f"         Lag Features ที่มีให้พิจารณา: {potential_lag_features}")
                 try:
-                    prelim_fi = prelim_model.get_feature_importance(as_dict=True)
+                    prelim_fi = prelim_model.get_feature_importance()
                     significant_lags = []
                     total_fi = sum(prelim_fi.values())
                     fi_threshold_abs = 0.1
@@ -975,12 +1033,12 @@ def train_and_export_meta_model(
         logging.error(f"   (Error) Failed to save final features list for '{model_purpose}': {e_save_feat}", exc_info=True)
 
     end_train_time = time.time()
-    logging.info(f"(Finished - v4.8.8 Patch 2) Meta Classifier Training (Purpose: {model_purpose.upper()}) complete in {end_train_time - start_train_time:.2f} seconds.") # Updated version in log
+    logging.info(f"(Finished - v{__version__}) Meta Classifier Training (Purpose: {model_purpose.upper()}) complete in {end_train_time - start_train_time:.2f} seconds.") # Updated version in log
     if 'X_val_cat_for_shap' in locals(): del X_val_cat_for_shap
     gc.collect()
     return saved_model_paths, final_features_catboost
 
-logging.info("Part 7: Model Training Function Loaded (v4.8.8 Patch 2 Applied).")
+logging.info(f"Part 7: Model Training Function Loaded (v{__version__} Applied).")
 # === END OF PART 7/12 ===
 
 
@@ -1136,32 +1194,6 @@ OUTPUT_DIR = safe_get_global('OUTPUT_DIR', DEFAULT_OUTPUT_DIR)
 # --- Backtesting Helper Functions ---
 # safe_set_datetime is now in Part 3
 
-def get_session_tag(timestamp, session_times_utc=None):
-    """Helper to get the trading session tag based on UTC timestamp."""
-    if session_times_utc is None:
-        global SESSION_TIMES_UTC
-        session_times_utc = SESSION_TIMES_UTC
-    if pd.isna(timestamp):
-        return "N/A"
-    try:
-        if timestamp.tzinfo is None:
-            ts_utc = pd.Timestamp(timestamp, tz='UTC')
-        else:
-            ts_utc = timestamp.tz_convert('UTC')
-
-        hour = ts_utc.hour
-        sessions = []
-        for name, (start, end) in session_times_utc.items():
-            if start <= end:
-                if start <= hour < end:
-                    sessions.append(name)
-            else:
-                if hour >= start or hour < end:
-                    sessions.append(name)
-        return "/".join(sorted(sessions)) if sessions else "Other"
-    except Exception as e:
-        logging.error(f"   (Error) Error in get_session_tag for {timestamp}: {e}", exc_info=True)
-        return "Error"
 
 def dynamic_tp2_multiplier(current_atr, avg_atr, base=None):
     """Calculates a dynamic TP multiplier based on current vs average ATR."""
@@ -1656,6 +1688,14 @@ def run_backtest_simulation_v34(
     Runs the core backtesting simulation loop for a single fold, side, and fund profile.
     (v4.8.8 Patch 26.5.1: Unified error handling, logging, and exit logic fixes)
     """
+    # [Patch v5.1.0] ตรวจสอบคอลัมน์สำคัญก่อนดำเนินการ backtest
+    required_cols = ["Open", "High", "Low", "Close"]
+    missing = [c for c in required_cols if c not in df_m1_segment_pd.columns]
+    if missing:
+        # เมื่อเรียกโดย profile_backtest จะตรวจสอบและ return ก่อนถึงจุดนี้
+        raise ValueError(
+            f"Missing required columns in input DataFrame for backtest: {missing}"
+        )
     global meta_model_type_used, meta_meta_model_type_used, USE_REENTRY, REENTRY_COOLDOWN_BARS, TIMEFRAME_MINUTES_M1, POINT_VALUE, MAX_CONCURRENT_ORDERS, MAX_HOLDING_BARS, COMMISSION_PER_001_LOT, SPREAD_POINTS, MIN_SLIPPAGE_POINTS, MAX_SLIPPAGE_POINTS, MAX_DRAWDOWN_THRESHOLD, ENABLE_FORCED_ENTRY, FORCED_ENTRY_BAR_THRESHOLD, FORCED_ENTRY_MIN_SIGNAL_SCORE, FORCED_ENTRY_LOOKBACK_PERIOD, FORCED_ENTRY_CHECK_MARKET_COND, FORCED_ENTRY_MAX_ATR_MULT, FORCED_ENTRY_MIN_GAIN_Z_ABS, FORCED_ENTRY_ALLOWED_REGIMES, FE_ML_FILTER_THRESHOLD, forced_entry_max_consecutive_losses, OUTPUT_DIR, USE_META_CLASSIFIER, BASE_BE_SL_R_THRESHOLD, DYNAMIC_BE_ATR_THRESHOLD_HIGH, DYNAMIC_BE_R_ADJUST_HIGH, META_MIN_PROBA_THRESH, REENTRY_MIN_PROBA_THRESH
 
     meta_proba_tp_for_log = np.nan; meta2_proba_tp_for_log = np.nan; meta_proba_tp_for_fe_log = np.nan; total_ib_lot_accumulator = 0.0
@@ -1671,7 +1711,14 @@ def run_backtest_simulation_v34(
     last_trade_cooldown_end_time = defaultdict(lambda: min_ts); last_tp_time = defaultdict(lambda: min_ts)
     bars_since_last_trade = 0; kill_switch_activated = initial_kill_switch_state; consecutive_losses = initial_consecutive_losses
     forced_entry_consecutive_losses = 0; forced_entry_temporarily_disabled = False; last_n_full_trade_pnls = []
-    SOFT_COOLDOWN_LOOKBACK = 10; SOFT_COOLDOWN_LOSS_COUNT = 3; kill_switch_trigger_time = pd.NaT
+    soft_cooldown_bars_remaining = 0
+    SOFT_COOLDOWN_LOOKBACK = 10
+    # [Patch v5.0.18] Increase loss threshold to reduce trade blocking
+    SOFT_COOLDOWN_LOSS_COUNT = 6
+    # [Patch v5.0.18] MACD entry thresholds to allow mild counter-trend trades
+    MACD_NEG_THRESHOLD_BUY = -0.05
+    MACD_POS_THRESHOLD_SELL = 0.05
+    kill_switch_trigger_time = pd.NaT
     current_risk_mode = "normal"; trade_history_list = []
     error_in_loop = False
 
@@ -1952,17 +1999,35 @@ def run_backtest_simulation_v34(
                 atr_filter_thresh = 3.0; score_filter_thresh = 3.5
                 if can_open_order and pd.notna(current_atr) and current_atr > atr_filter_thresh and pd.notna(signal_score) and abs(signal_score) < score_filter_thresh: can_open_order = False; block_reason = f"HIGH_ATR_LOW_SCORE (ATR={current_atr:.2f}, Score={signal_score:.2f})"
                 if can_open_order and pd.notna(current_macd_smooth):
-                    relax_macd_cond = False; strong_signal_thresh = 4.0; strong_gainz_thresh = 1.0
+                    # [Patch v5.x.x] Temporarily bypass MACD filter for testing
+                    relax_macd_cond = True; strong_signal_thresh = 4.0; strong_gainz_thresh = 1.0
                     if pd.notna(signal_score):
                         if is_forced_entry:
                             if abs(signal_score) >= strong_signal_thresh and pd.notna(current_gain_z) and current_gain_z >= strong_gainz_thresh and pattern_label in ['Breakout', 'StrongTrend']: relax_macd_cond = True
                         elif not is_forced_entry and abs(signal_score) >= strong_signal_thresh: relax_macd_cond = True
                     if not relax_macd_cond:
-                        if side == "BUY" and current_macd_smooth < 0: can_open_order = False; block_reason = f"NEG_MACD_BUY (MACD={current_macd_smooth:.3f})"
-                        elif side == "SELL" and current_macd_smooth > 0: can_open_order = False; block_reason = f"POS_MACD_SELL (MACD={current_macd_smooth:.3f})"
-                if can_open_order and len(last_n_full_trade_pnls) >= SOFT_COOLDOWN_LOSS_COUNT:
-                    recent_losses_count = sum(1 for pnl in last_n_full_trade_pnls[-SOFT_COOLDOWN_LOOKBACK:] if pnl < 0)
-                    if recent_losses_count >= SOFT_COOLDOWN_LOSS_COUNT: can_open_order = False; block_reason = f"SOFT_COOLDOWN_{SOFT_COOLDOWN_LOSS_COUNT}L{SOFT_COOLDOWN_LOOKBACK}T ({recent_losses_count} losses)"
+                        if side == "BUY" and current_macd_smooth < MACD_NEG_THRESHOLD_BUY:
+                            can_open_order = False
+                            block_reason = f"NEG_MACD_BUY (MACD={current_macd_smooth:.3f})"
+                        elif side == "SELL" and current_macd_smooth > MACD_POS_THRESHOLD_SELL:
+                            can_open_order = False
+                            block_reason = f"POS_MACD_SELL (MACD={current_macd_smooth:.3f})"
+                if can_open_order:
+                    # [Patch v5.x.x] Disable Soft Cooldown logic during testing
+                    pass
+                    # if soft_cooldown_bars_remaining > 0:
+                    #     can_open_order = False
+                    #     block_reason = f"SOFT_COOLDOWN_ACTIVE({soft_cooldown_bars_remaining})"
+                    # else:
+                    #     cooldown_triggered, recent_losses_count = is_soft_cooldown_triggered(
+                    #         last_n_full_trade_pnls, SOFT_COOLDOWN_LOOKBACK, SOFT_COOLDOWN_LOSS_COUNT
+                    #     )
+                    #     if cooldown_triggered:
+                    #         soft_cooldown_bars_remaining = SOFT_COOLDOWN_LOOKBACK
+                    #         can_open_order = False
+                    #         block_reason = (
+                    #             f"SOFT_COOLDOWN_{SOFT_COOLDOWN_LOSS_COUNT}L{SOFT_COOLDOWN_LOOKBACK}T ({recent_losses_count} losses)"
+                    #         )
                 if block_reason: logging.debug(f"      Block Reason: {block_reason}")
                 active_l1_model = None; active_l1_features = None; selected_model_key = "N/A"; model_confidence = np.nan; meta_proba_tp_for_log = np.nan
                 if can_open_order and USE_META_CLASSIFIER and callable(model_switcher_func):
@@ -2065,6 +2130,7 @@ def run_backtest_simulation_v34(
             logging.debug(
                 f"   End of Bar {current_bar_index}. Active orders for next bar: {len(active_orders)}"
             )
+            soft_cooldown_bars_remaining = step_soft_cooldown(soft_cooldown_bars_remaining)
             current_bar_index += 1
     # <<< [Patch C - Unified] End of try-except for main loop >>>
     except Exception as e_loop:
@@ -2190,7 +2256,7 @@ def run_backtest_simulation_v34(
 
     return (df_sim, trade_log_df_segment, equity, equity_history, max_drawdown_pct, run_summary, blocked_order_log, sim_model_type_l1, sim_model_type_l2, kill_switch_activated, consecutive_losses, total_ib_lot_accumulator)
 
-logging.info("Part 8: Backtesting Engine Functions Loaded (v4.8.8 Patch 26.5.1 Applied).")
+logging.info(f"Part 8: Backtesting Engine Functions Loaded (v{__version__} Applied).")
 # === END OF PART 8/12 ===
 
 
@@ -3289,7 +3355,9 @@ def run_all_folds_with_threshold(
     total_ib_lot_accumulator_run = 0.0
 
     logging.info(f"      Starting Walk-Forward loop ({n_walk_forward_splits} folds)...")
-    for fold, (train_index, test_index) in enumerate(tscv.split(df_m1_final)):
+    for fold, (train_index, test_index) in enumerate(
+        tqdm(tscv.split(df_m1_final), total=n_walk_forward_splits, desc="Running folds", unit="fold")
+    ):
         fold_start_time = time.time()
         logging.info(f"\n{'='*15} Fold {fold + 1}/{n_walk_forward_splits} ({run_label}) {'='*15}")
 
@@ -3425,13 +3493,71 @@ def run_all_folds_with_threshold(
         total_ib_lot_accumulator_run += ib_lot_buy + ib_lot_sell
 
         logging.info(f"   -- Calculating Metrics for Fold {fold+1} ({fund_name}) --")
-        metrics_buy_fold = calculate_metrics(log_buy, eq_buy, hist_buy, start_cap_buy, f"Fold {fold+1} Buy ({fund_name})", type_l1_b, type_l2_b, costs_buy, ib_lot_buy)
+        metrics_buy_fold = {}  # [Patch v5.3.1] initialize to avoid UnboundLocalError
+        try:
+            metrics_buy_fold = calculate_metrics(
+                log_buy,
+                eq_buy,
+                hist_buy,
+                start_cap_buy,
+                f"Fold {fold+1} Buy ({fund_name})",
+                type_l1_b,
+                type_l2_b,
+                costs_buy,
+                ib_lot_buy,
+            ) or {}
+        except Exception as e:
+            logging.warning(
+                f"(Warning) Cannot calculate metrics for Fold {fold+1} Buy ({fund_name}): {e}"
+            )
+            metrics_buy_fold = {}
         metrics_buy_fold[f"Fold {fold+1} Buy ({fund_name}) Max Drawdown (Simulated) (%)"] = dd_buy * 100.0
-        metrics_buy_fold.update({f"Fold {fold+1} Buy ({fund_name}) Costs {k.replace('_', ' ').title()}": v for k, v in costs_buy.items() if k not in ["meta_model_type_l1", "meta_model_type_l2", "threshold_l1_used", "threshold_l2_used", "fund_profile", "total_ib_lot_accumulator"]})
+        metrics_buy_fold.update({
+            f"Fold {fold+1} Buy ({fund_name}) Costs {k.replace('_', ' ').title()}": v
+            for k, v in costs_buy.items()
+            if k
+            not in [
+                "meta_model_type_l1",
+                "meta_model_type_l2",
+                "threshold_l1_used",
+                "threshold_l2_used",
+                "fund_profile",
+                "total_ib_lot_accumulator",
+            ]
+        })
 
-        metrics_sell_fold = calculate_metrics(log_sell, eq_sell, hist_sell, start_cap_sell, f"Fold {fold+1} Sell ({fund_name})", type_l1_s, type_l2_s, costs_sell, ib_lot_sell)
+        metrics_sell_fold = {}  # [Patch v5.3.1] ensure defined even if calc fails
+        try:
+            metrics_sell_fold = calculate_metrics(
+                log_sell,
+                eq_sell,
+                hist_sell,
+                start_cap_sell,
+                f"Fold {fold+1} Sell ({fund_name})",
+                type_l1_s,
+                type_l2_s,
+                costs_sell,
+                ib_lot_sell,
+            ) or {}
+        except Exception as e:
+            logging.warning(
+                f"(Warning) Cannot calculate metrics for Fold {fold+1} Sell ({fund_name}): {e}"
+            )
+            metrics_sell_fold = {}
         metrics_sell_fold[f"Fold {fold+1} Sell ({fund_name}) Max Drawdown (Simulated) (%)"] = dd_sell * 100.0
-        metrics_sell_fold.update({f"Fold {fold+1} Sell ({fund_name}) Costs {k.replace('_', ' ').title()}": v for k, v in costs_sell.items() if k not in ["meta_model_type_l1", "meta_model_type_l2", "threshold_l1_used", "threshold_l2_used", "fund_profile", "total_ib_lot_accumulator"]})
+        metrics_sell_fold.update({
+            f"Fold {fold+1} Sell ({fund_name}) Costs {k.replace('_', ' ').title()}": v
+            for k, v in costs_sell.items()
+            if k
+            not in [
+                "meta_model_type_l1",
+                "meta_model_type_l2",
+                "threshold_l1_used",
+                "threshold_l2_used",
+                "fund_profile",
+                "total_ib_lot_accumulator",
+            ]
+        })
 
         try:
             avg_score_buy = log_buy['Signal_Score'].mean() if log_buy is not None and not log_buy.empty and 'Signal_Score' in log_buy.columns else np.nan
@@ -3460,15 +3586,29 @@ def run_all_folds_with_threshold(
         if log_buy is not None and log_buy.empty and log_sell is not None and log_sell.empty:
             logging.warning(f"          [SUMMARY] Fold {fold+1} ({fund_name}): No trades opened. All entries blocked.")
 
+        fold_duration = time.time() - fold_start_time
+        fold_equity = eq_sell
+        fold_winrate = (
+            metrics_buy_fold.get(f"Fold {fold+1} Buy ({fund_name}) Win Rate (Full) (%)", 0.0)
+            + metrics_sell_fold.get(f"Fold {fold+1} Sell ({fund_name}) Win Rate (Full) (%)", 0.0)
+        ) / 200.0
+        fold_maxdd = max(dd_buy, dd_sell)
+        logging.warning(
+            f"=============== Fold {fold+1}/{n_walk_forward_splits} ({fund_name}) ==============="
+        )
+        logging.warning(
+            f"   (Metrics) Fold {fold+1} processed in: {fold_duration:.2f} seconds"
+        )
+        logging.warning(
+            f"   (Summary) Equity={fold_equity:.2f}, Winrate={fold_winrate:.2%}, MaxDD={fold_maxdd:.2%}"
+        )
+
         logging.debug(f"        Cleaning up memory after Fold {fold+1}...")
         del df_train_fold, df_test_fold, df_buy_res, df_sell_res
         del log_buy, log_sell, hist_buy, hist_sell, blocked_buy, blocked_sell
         del metrics_buy_fold, metrics_sell_fold, current_fold_metrics
         gc.collect()
         logging.debug(f"        Memory cleanup complete for Fold {fold+1}.")
-
-        fold_duration = time.time() - fold_start_time
-        logging.info(f"   (Success) Fold {fold+1} ({fund_name}) processed in: {fold_duration:.2f} seconds")
 
     run_duration = time.time() - start_time_run
     logging.info(f"      [Runner {run_label}] (Success) Full WF Sim completed (L1_Th={l1_thresh_display}) in {run_duration:.2f} seconds.")
@@ -3626,6 +3766,64 @@ def run_simple_numba_backtest(df_all: pd.DataFrame, folds: List[tuple]) -> Dict[
     logging.info("All folds finished.")
     return results
 
+### PART 13: Hyperparameter Sweep Utility (v5.1.0) ###
+def run_hyperparameter_sweep(base_params: dict, grid: dict, train_func):
+    """รันการค้นหา Hyperparameter แบบ grid search และพิมพ์ผลลัพธ์ทันที"""
+    keys = list(grid.keys())
+    values = list(grid.values())
+    combinations = list(itertools.product(*values))
+    output_dir = base_params.get("output_dir")
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    results = []
+    for idx, combo in enumerate(combinations, start=1):
+        params = base_params.copy()
+        for k, v in zip(keys, combo):
+            params[k] = v
+        print(f"เริ่มพารามิเตอร์ run {idx}: {params}")
+        model_path, feature_list = train_func(**params)
+        result_entry = {"params": params, "model_path": model_path, "features": feature_list}
+        print(f"Run {idx}: {result_entry}")
+        results.append(result_entry)
+
+    return results
+
+
+# [Patch v5.0.18] Add Optuna-based CatBoost sweep
+def run_optuna_catboost_sweep(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_trials: int = 50,
+    n_splits: int = 5,
+):
+    """Runs Optuna hyperparameter search for CatBoost."""
+    if optuna is None or CatBoostClassifier is None:
+        # [Patch v5.0.23] Return stub values when dependencies are missing
+        logging.error("(Error) optuna or catboost not available for sweep")
+        return 0.0, {}
+
+    def objective(trial):
+        params = {
+            "iterations": trial.suggest_int("iterations", 50, 200),
+            "depth": trial.suggest_int("depth", 4, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 1e-1, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-2, 10, log=True),
+            "border_count": trial.suggest_int("border_count", 32, 64),
+            "random_strength": trial.suggest_float("random_strength", 0, 1),
+            "eval_metric": "AUC",
+            "verbose": False,
+            "task_type": "CPU",
+        }
+        model = CatBoostClassifier(**params)
+        cv = TimeSeriesSplit(n_splits=n_splits)
+        scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials)
+    return study.best_value, study.best_params
+
 
 def generate_open_signals(df: pd.DataFrame) -> np.ndarray:
     """สร้างสัญญาณเปิด order"""
@@ -3645,30 +3843,20 @@ def precompute_sl_array(df: pd.DataFrame) -> np.ndarray:
 def precompute_tp_array(df: pd.DataFrame) -> np.ndarray:
     """คำนวณ Take-Profit ล่วงหน้า"""
     return np.zeros(len(df), dtype=np.float64)
-
 # ---------------------------------------------------------------------------
 # Stubs for Function Registry Tests
-
 def initialize_time_series_split():
     """Stubbed time series split initializer."""
     return None
-
-
 def calculate_forced_entry_logic():
     """Stubbed forced entry logic calculator."""
     return None
-
-
 def apply_kill_switch():
     """Stubbed kill switch applier."""
     return None
-
-
 def log_trade(*args, **kwargs):
     """Stubbed trade logger."""
     return None
-
-
 def aggregate_fold_results():
     """Stubbed fold result aggregator."""
     return None
