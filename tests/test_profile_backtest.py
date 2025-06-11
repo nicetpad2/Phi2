@@ -4,7 +4,7 @@ import pandas as pd
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT_DIR)
-sys.path.insert(0, os.path.join(ROOT_DIR, 'src'))
+sys.path.insert(1, os.path.join(ROOT_DIR, 'src'))
 
 import profile_backtest
 import logging
@@ -135,6 +135,27 @@ def test_profile_cli_output_file(tmp_path, monkeypatch):
     assert 'ncalls' in text
 
 
+def test_profile_cli_output_dir(tmp_path, monkeypatch):
+    df = pd.DataFrame({
+        'Datetime': pd.date_range('2022-01-01', periods=2, freq='min', tz='UTC'),
+        'Open': [1, 2], 'High': [1, 2], 'Low': [1, 2], 'Close': [1, 2]
+    })
+    m1 = tmp_path / 'mini_M1.csv'
+    df.to_csv(m1, index=False)
+
+    monkeypatch.setattr(profile_backtest, 'run_backtest_simulation_v34', lambda *a, **k: None)
+
+    out_dir = tmp_path / 'profiles'
+    monkeypatch.setattr(sys, 'argv', [
+        'profile_backtest.py', str(m1), '--rows', '2', '--output-profile-dir', str(out_dir)
+    ])
+
+    profile_backtest.profile_from_cli()
+
+    prof_files = list(out_dir.glob('*.prof'))
+    assert len(prof_files) == 1
+
+
 def test_main_profile_custom_fund(monkeypatch, tmp_path):
     df = pd.DataFrame({
         'Datetime': pd.date_range('2022-01-01', periods=2, freq='min', tz='UTC'),
@@ -177,7 +198,7 @@ def test_main_profile_train_option(monkeypatch, tmp_path):
         called['out'] = out
         return {}
 
-    monkeypatch.setattr(profile_backtest, 'real_train_func', dummy_train)
+    monkeypatch.setattr('src.training.real_train_func', dummy_train)
 
     out_dir = tmp_path / 'models'
     profile_backtest.main_profile(str(csv_path), num_rows=2, train=True, train_output=str(out_dir))
@@ -204,7 +225,7 @@ def test_profile_cli_fund_and_train(monkeypatch, tmp_path):
         called['out'] = out
         return {}
 
-    monkeypatch.setattr(profile_backtest, 'real_train_func', dummy_train)
+    monkeypatch.setattr('src.training.real_train_func', dummy_train)
 
     out = tmp_path / 'stats.txt'
     prof = tmp_path / 'cli.prof'

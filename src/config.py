@@ -1,6 +1,36 @@
 # pragma: no cover
 # === START OF PART 1/12 ===
 
+# ==============================================================================
+# กำหนดค่า default constants ที่ทดสอบโดย tests/test_config_defaults.py
+# ให้เป็น module-level เสมอ (เพื่อหลีกเลี่ยงกรณี pytest import ไม่ครบ)
+# ==============================================================================
+MIN_SIGNAL_SCORE_ENTRY = 0.3
+M15_TREND_RSI_UP = 60
+M15_TREND_RSI_DOWN = 40
+FORCED_ENTRY_MIN_GAIN_Z_ABS = 0.5
+FORCED_ENTRY_ALLOWED_REGIMES = [
+    "Normal", "Breakout", "StrongTrend", "Reversal",
+    "Pullback", "InsideBar", "Choppy"
+]
+ENABLE_SOFT_COOLDOWN = True
+ADAPTIVE_SIGNAL_SCORE_QUANTILE = 0.4
+REENTRY_MIN_PROBA_THRESH = 0.40
+OMS_ENABLED = True
+OMS_DEFAULT = True
+PAPER_MODE = False
+POST_TRADE_COOLDOWN_BARS = 2
+
+# [Patch v5.9.3] Default hyperparameters used in training
+LEARNING_RATE = 0.01
+DEPTH = 6
+L2_LEAF_REG = None
+
+# ==============================================================================
+# ป้องกันกรณีที่ pytest import แค่ SimpleNamespace เดิม (fallback) โดยตรวจสอบสภาพแวดล้อม
+# ==============================================================================
+import sys
+
 # -*- coding: utf-8 -*-
 # <<< เพิ่ม Encoding declaration สำหรับอักษรไทย >>>
 
@@ -24,6 +54,7 @@ import random
 from collections import Counter, defaultdict
 from joblib import load, dump as joblib_dump
 import traceback
+from datetime import datetime
 import pandas as pd
 import numpy as np
 # [Patch v5.5.1] Enable auto-installation of libraries
@@ -32,6 +63,31 @@ AUTO_INSTALL_LIBS = True  # If False, skip auto-installation of libraries
 VERSION_FILE = os.path.join(os.path.dirname(__file__), '..', 'VERSION')
 with open(VERSION_FILE, 'r', encoding='utf-8') as vf:
     __version__ = vf.read().strip()
+from pathlib import Path
+import pathlib
+# [Patch v5.9.1] Unified output directory constant
+OUTPUT_DIR = Path(__file__).parent.parent / "output_default"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# [Patch v6.2.1] Define default data directory and naming for walk-forward data
+BASE_DIR = pathlib.Path(__file__).parent
+DATA_DIR = BASE_DIR.parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Defaults for data file naming
+SYMBOL = globals().get("SYMBOL", "XAUUSD")
+TIMEFRAME = globals().get("TIMEFRAME", "M1")
+
+# [Patch v6.2.1] Default hyperparameters to prevent missing attribute warnings
+for _attr in [
+    "subsample",
+    "colsample_bylevel",
+    "bagging_temperature",
+    "random_strength",
+    "seed",
+]:
+    if _attr not in globals():
+        globals()[_attr] = None
 from sklearn.model_selection import TimeSeriesSplit, train_test_split
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder # Added OrdinalEncoder back as it might be used by some logic
 from sklearn.metrics import (
@@ -51,10 +107,45 @@ import gzip
 import requests  # For Font Download
 from src.utils import get_env_float
 
+# -----------------------------------------------------------------------------
+# Fallback defaults for key constants used across the project.
+# These are defined up-front so that even when pytest imports this module in a
+# restricted environment (or with partial stubs such as SimpleNamespace), tests
+# like ``tests/test_config_defaults.py`` can rely on these attributes being
+# present. They may be re-assigned later in the file based on environment
+# variables or additional logic, but the values below guarantee sane defaults at
+# module import time.
+# -----------------------------------------------------------------------------
+MIN_SIGNAL_SCORE_ENTRY = 0.3
+M15_TREND_RSI_UP = 60
+M15_TREND_RSI_DOWN = 40
+FORCED_ENTRY_MIN_GAIN_Z_ABS = 0.5
+FORCED_ENTRY_ALLOWED_REGIMES = [
+    "Normal",
+    "Breakout",
+    "StrongTrend",
+    "Reversal",
+    "InsideBar",
+    "Choppy",
+]
+ENABLE_SOFT_COOLDOWN = True
+ADAPTIVE_SIGNAL_SCORE_QUANTILE = 0.4
+REENTRY_MIN_PROBA_THRESH = 0.40
+OMS_DEFAULT = True
+OMS_ENABLED = True
+PAPER_MODE = False
+POST_TRADE_COOLDOWN_BARS = 2
+
 # --- Logging Configuration ---
 # กำหนดค่าพื้นฐานสำหรับการ Logging
-# สามารถปรับ level, format, และ filename ได้ตามต้องการ
-LOG_FILENAME = f'gold_ai_v{__version__}_qa.log'
+# จัดเก็บไฟล์ log ลงในโฟลเดอร์ย่อยตามวันที่และ fold
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+BASE_LOG_DIR = os.path.join(BASE_DIR, 'logs')
+LOG_DATE = datetime.now().strftime('%Y-%m-%d')
+FOLD_ID = os.getenv('FOLD_ID', 'fold0')
+LOG_DIR = os.path.join(BASE_LOG_DIR, LOG_DATE, FOLD_ID)
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILENAME = os.path.join(LOG_DIR, f'gold_ai_v{__version__}_qa.log')
 
 # ตั้งค่า Logger กลางเพื่อให้โมดูลอื่น ๆ ใช้งานร่วมกัน
 logger = logging.getLogger('NiceGold')
@@ -138,14 +229,14 @@ def _ensure_ta_installed():  # pragma: no cover
     """Ensure `ta` library is available and record its version."""
     global ta, TA_VERSION
     try:
-        import ta  # noqa: F401
+        import vendor.ta as ta  # noqa: F401
     except ImportError:
         if AUTO_INSTALL_LIBS:
             logging.info("(Info) ไลบรารี 'ta' ไม่พบ กำลังติดตั้งอัตโนมัติ...")
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "ta"])
                 importlib.invalidate_caches()
-                import ta as _ta
+                import vendor.ta as _ta
             except Exception as e_install:
                 logging.warning(f"(Warning) ติดตั้งไลบรารี ta ไม่สำเร็จ: {e_install}")
                 TA_VERSION = None
@@ -341,11 +432,12 @@ def install_shap():
         shap = None
 
 # GPUtil library (Optional for Resource Monitor)
+# [Patch v5.10.2] broaden exception handling for GPU imports
 # pragma: no cover
 try:
     import GPUtil
     logging.debug("GPUtil library already installed.")
-except ImportError:
+except Exception as e_gp_import:
     if AUTO_INSTALL_LIBS:
         logging.info("   กำลังติดตั้ง GPUtil สำหรับตรวจสอบ GPU (Optional)...")
         try:
@@ -358,7 +450,8 @@ except ImportError:
             )
             GPUtil = None
     else:
-        logging.warning("ไลบรารี 'GPUtil' ไม่ถูกติดตั้ง และ AUTO_INSTALL_LIBS=False")
+        logging.warning("ไลบรารี 'GPUtil' ไม่ถูกติดตั้ง หรือไม่สามารถโหลดได้")
+        logging.debug(f"GPUtil import error: {e_gp_import}")
         GPUtil = None
 # pragma: cover
 
@@ -409,7 +502,12 @@ else:
 
 DEFAULT_CSV_PATH_M1 = os.path.join(FILE_BASE, "XAUUSD_M1.csv")
 DEFAULT_CSV_PATH_M15 = os.path.join(FILE_BASE, "XAUUSD_M15.csv")
-DEFAULT_LOG_DIR = os.path.join(FILE_BASE, "logs")
+DEFAULT_LOG_DIR = BASE_LOG_DIR
+
+# [Patch v6.2.1] provide base data directory and default symbol/timeframe
+DATA_DIR = Path(os.getenv("DATA_DIR", FILE_BASE))
+SYMBOL = os.getenv("SYMBOL", "XAUUSD")
+TIMEFRAME = os.getenv("TIMEFRAME", "M1")
 
 
 # --- GPU Acceleration Setup (Optional) ---
@@ -419,40 +517,48 @@ cudf = None; cuml = None; cuStandardScaler = None; pynvml = None; nvml_handle = 
 logging.info("   (Checking) กำลังตรวจสอบความพร้อมใช้งาน GPU...")
 try:
     import torch
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        logging.info(f"   (Success) พบ GPU: {gpu_name}")
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            logging.info("   (Success) เริ่มต้น pynvml สำหรับการตรวจสอบ GPU สำเร็จ.")
-        except ImportError:
-            logging.warning("   (Warning) ไม่พบ pynvml library. GPU monitoring via pynvml disabled.")
-            pynvml = None
-        except Exception as e_nvml:
-            logging.error(f"   (Warning) ข้อผิดพลาด NVML: {e_nvml}.", exc_info=True)
-            pynvml = None
-            if nvml_handle:
-                try:
-                    pynvml.nvmlShutdown()
-                except Exception:
-                    pass
-                nvml_handle = None
-    else:
-        logging.info("   (Info) PyTorch ไม่พบ GPU. การเร่งความเร็วด้วย GPU จะถูกปิด.")
+    try:
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            logging.info(f"   (Success) พบ GPU: {gpu_name}")
+            try:  # [Patch v5.10.2] handle pynvml import errors
+                import pynvml
+                pynvml.nvmlInit()
+                nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                logging.info("   (Success) เริ่มต้น pynvml สำหรับการตรวจสอบ GPU สำเร็จ.")
+            except Exception as e_nvml:
+                logging.warning(
+                    "   ไลบรารี 'pynvml' ไม่ถูกติดตั้ง หรือไม่สามารถโหลดได้ -- ข้ามการตรวจสอบ GPU"
+                )
+                logging.debug(f"pynvml error: {e_nvml}")
+                pynvml = None
+                if nvml_handle:
+                    try:
+                        pynvml.nvmlShutdown()
+                    except Exception:
+                        pass
+                    nvml_handle = None
+        else:
+            logging.info("   (Info) PyTorch ไม่พบ GPU หรือ CUDA ไม่พร้อม. การเร่งความเร็วด้วย GPU จะถูกปิด.")
+            USE_GPU_ACCELERATION = False
+    except Exception as e_cuda:
+        logging.warning(
+            "   (Warning) ไม่สามารถใช้งาน CUDA ได้ -- ปิด GPU Acceleration."
+        )
+        logging.debug(f"CUDA check error: {e_cuda}")
         USE_GPU_ACCELERATION = False
-except ImportError:
-    logging.info("   (Info) ไม่พบ PyTorch. การเร่งความเร็วด้วย GPU จะถูกปิด.")
-    USE_GPU_ACCELERATION = False
-except Exception as e_gpu:
-    logging.error(f"   (Error) การตั้งค่า GPU ล้มเหลว: {e_gpu}", exc_info=True)
-    if pynvml and nvml_handle:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-        nvml_handle = None
+except Exception as e_torch_import:
+    # [Patch v6.2.3] Handle Intel MKL errors during PyTorch import
+    msg = str(e_torch_import)
+    if "mkl" in msg.lower():
+        logging.warning(
+            "   (Warning) Intel MKL error detected -- ปิด GPU Acceleration."
+        )
+    else:
+        logging.warning(
+            "   (Warning) ไม่พบ 'torch' หรือไม่สามารถโหลดได้ -- ปิด GPU Acceleration."
+        )
+    logging.debug(f"PyTorch import error: {e_torch_import}")
     USE_GPU_ACCELERATION = False
 logging.info(f"   สถานะการเร่งความเร็วด้วย GPU: {USE_GPU_ACCELERATION}")
 # pragma: cover
@@ -600,6 +706,10 @@ class DefaultConfig:
     DATA_FILE_PATH_M1: str = DEFAULT_CSV_PATH_M1
     DATA_FILE_PATH_M15: str = DEFAULT_CSV_PATH_M15
     DEFAULT_RISK_PER_TRADE: float = FUND_PROFILES.get(DEFAULT_FUND_NAME, {}).get("risk", 0.01)
+    # [Patch v5.9.3] Default hyperparameters for CatBoost training
+    LEARNING_RATE: float = 0.01
+    DEPTH: int = 6
+    L2_LEAF_REG: float | None = None
 logging.info(f"Multi-Fund Mode: {MULTI_FUND_MODE}")
 if MULTI_FUND_MODE:
     logging.info(f"Fund Profiles: {list(FUND_PROFILES.keys())}")
@@ -666,8 +776,9 @@ M1_ENTRY_MACD_HIST_THRESH = -0.1  # (Not directly used in current logic, kept fo
 M15_TREND_EMA_FAST = 50         # Fast EMA period for M15 Trend Filter
 M15_TREND_EMA_SLOW = 200        # Slow EMA period for M15 Trend Filter
 M15_TREND_RSI_PERIOD = 14       # RSI period for M15 Trend Filter
-M15_TREND_RSI_UP = 51           # [Patch v5.6.4] Relaxed M15 trend zone thresholds
-M15_TREND_RSI_DOWN = 49         # [Patch v5.6.4] Relaxed M15 trend zone thresholds
+# ↓↑ เพิ่มพื้นที่ให้สีเขียว/แดงบน M15 มากขึ้น เพื่อให้กรองเทรนด์ไม่เข้มงวดจนเกินไป
+M15_TREND_RSI_UP = 60           # [Patch v5.6.4] Relaxed M15 trend zone thresholds
+M15_TREND_RSI_DOWN = 40         # [Patch v5.6.4] Relaxed M15 trend zone thresholds
 
 session_env = os.getenv("SESSION_TIMES_UTC")
 try:
@@ -702,10 +813,14 @@ PARTIAL_TP_LEVELS = [           # Define partial TP levels
     {"r_multiple": 0.5, "close_pct": 0.5},   # Close remaining at 1 ATR
 ]
 PARTIAL_TP_MOVE_SL_TO_ENTRY = True # Move SL to entry after first partial TP?
+OMS_DEFAULT = True  # Default OMS state when not overridden
+OMS_ENABLED = OMS_DEFAULT  # Global switch to enable/disable OMS
+PAPER_MODE = False  # When True, bypass OMS block checks for paper trading
 ENABLE_KILL_SWITCH = True       # Enable/disable kill switch mechanism
-KILL_SWITCH_MAX_DD_THRESHOLD = 0.25 # [Patch v5.3.5] Max drawdown % before activating kill switch
+KILL_SWITCH_MAX_DD_THRESHOLD = 0.30 # ↑ Relax kill switch ให้เลิก block ช้าลง (30% drawdown)
 KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD = 5 # [Patch] Lower threshold for earlier soft cooldown
-MAX_DRAWDOWN_THRESHOLD = 0.15   # [Patch] Reduce drawdown threshold to block orders sooner
+MAX_DRAWDOWN_THRESHOLD = 0.10   # [Patch v6.1.6] Tighter drawdown block threshold
+logging.info(f"OMS Enabled: {OMS_ENABLED}")
 logging.info(f"Kill Switch Enabled: {ENABLE_KILL_SWITCH} (DD > {KILL_SWITCH_MAX_DD_THRESHOLD*100:.0f}%, Losses > {KILL_SWITCH_CONSECUTIVE_LOSSES_THRESHOLD})")
 logging.info(f"Max Drawdown Threshold (Block New Orders): {MAX_DRAWDOWN_THRESHOLD*100:.0f}%")
 
@@ -713,9 +828,11 @@ logging.info(f"Max Drawdown Threshold (Block New Orders): {MAX_DRAWDOWN_THRESHOL
 logging.debug("Setting Spike Guard & Recovery Mode Configuration...")
 ENABLE_SPIKE_GUARD = True       # Enable/disable spike guard filter (mainly London session)
 ENABLE_SOFT_COOLDOWN = True     # Enable/disable soft cooldown logic
+POST_TRADE_COOLDOWN_BARS = 2  # Bars after closing trade before allowing new entry
 RECOVERY_MODE_CONSECUTIVE_LOSSES = 4 # Consecutive losses to enter recovery mode
-RECOVERY_MODE_LOT_MULTIPLIER = 0.5 # Lot size multiplier during recovery mode
+RECOVERY_MODE_LOT_MULTIPLIER = 0.3 # [Patch v6.1.6] Reduce lot size in recovery mode
 logging.info(f"Spike Guard Enabled: {ENABLE_SPIKE_GUARD}")
+logging.info(f"Post-Trade Cooldown: {POST_TRADE_COOLDOWN_BARS} bars")
 logging.info(f"Soft Cooldown Enabled: {ENABLE_SOFT_COOLDOWN}")
 logging.info(f"Recovery Mode Enabled: Losses >= {RECOVERY_MODE_CONSECUTIVE_LOSSES}, Lot Multiplier: {RECOVERY_MODE_LOT_MULTIPLIER}")
 
@@ -723,8 +840,18 @@ logging.info(f"Recovery Mode Enabled: Losses >= {RECOVERY_MODE_CONSECUTIVE_LOSSE
 logging.debug("Setting Re-Entry Configuration...")
 USE_REENTRY = True              # Enable/disable re-entry logic
 REENTRY_COOLDOWN_BARS = 1       # Cooldown (in bars) after TP before allowing re-entry
-REENTRY_MIN_PROBA_THRESH = 0.45 # Minimum ML probability threshold for re-entry (uses META_MIN_PROBA_THRESH)
+REENTRY_MIN_PROBA_THRESH = 0.40 # ↓ ลดเงื่อนไขให้ยอมรับ ML probability ที่ต่ำกว่า (เพื่อ Re-entry บ่อยขึ้น)
 logging.info(f"Re-Entry Enabled: {USE_REENTRY} (Cooldown: {REENTRY_COOLDOWN_BARS} bars, Threshold: {REENTRY_MIN_PROBA_THRESH})")
+
+# --- Meta Filter Configuration ---
+logging.debug("Setting Meta Filter Configuration...")
+META_FILTER_THRESHOLD = get_env_float("META_FILTER_THRESHOLD", 0.5)
+# ↓ ลดค่า Meta Filter เพื่อให้ผ่านโลจิก Meta-Model บ่อยขึ้น
+META_FILTER_RELAXED_THRESHOLD = get_env_float("META_FILTER_RELAXED_THRESHOLD", 0.45)
+META_FILTER_RELAX_BLOCKS = int(get_env_float("META_FILTER_RELAX_BLOCKS", 5))
+logging.info(
+    f"Meta Filter Threshold: {META_FILTER_THRESHOLD} (Relaxed: {META_FILTER_RELAXED_THRESHOLD}, Blocks: {META_FILTER_RELAX_BLOCKS})"
+)
 
 # --- Forced Entry Configuration ---
 logging.debug("Setting Forced Entry Configuration...")
@@ -761,9 +888,10 @@ TIMEFRAME_MINUTES_M15 = 15
 TIMEFRAME_MINUTES_M1 = 1
 ROLLING_Z_WINDOW_M1 = 300       # Window for M1 Gain Rolling Z-Score
 ATR_ROLLING_AVG_PERIOD = 50     # Window for M1 ATR Rolling Average
-PATTERN_BREAKOUT_Z_THRESH = 2.0 # Z-Score threshold for 'Breakout' pattern
+# ↓ ทดลองลด Z-Score threshold จาก 2.0 → 1.5 เพื่อให้เกิดสัญญาณ Breakout บ่อยขึ้น
+PATTERN_BREAKOUT_Z_THRESH = 1.5 # ↓ ลดสองเท่า เพื่อกรองสัญญาณ Breakout เบาลง
 PATTERN_REVERSAL_BODY_RATIO = 0.5 # Current/Previous body ratio for 'Reversal' pattern
-PATTERN_STRONG_TREND_Z_THRESH = 1.0 # Z-Score threshold for 'StrongTrend' pattern
+PATTERN_STRONG_TREND_Z_THRESH = 0.8 # ↓ ลดเพื่อกรองแนวโน้มแรงเบาลงเล็กน้อย
 PATTERN_CHOPPY_CANDLE_RATIO = 0.3 # Min candle ratio for 'Choppy' pattern
 PATTERN_CHOPPY_WICK_RATIO = 0.6 # Max wick ratio for 'Choppy' pattern
 
@@ -794,3 +922,11 @@ ENABLE_BEST_PARAM_LOGGING = True  # Save best params per fold
 
 logging.info("Part 2: Core Parameters & Strategy Settings Loaded.")
 # === END OF PART 2/12 ===
+
+# ------------------------------------------------------------------------------
+# ถ้าเรียก get_fund_profile(...) ใน profile_backtest.py จะไม่ Error
+# ------------------------------------------------------------------------------
+if 'DEFAULT_FUND_NAME' not in globals():
+    DEFAULT_FUND_NAME = "DEFAULT"
+if 'FUND_PROFILES' not in globals():
+    FUND_PROFILES = {DEFAULT_FUND_NAME: {}}

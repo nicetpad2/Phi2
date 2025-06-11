@@ -3,6 +3,24 @@ import logging
 from pathlib import Path
 from typing import Optional, Tuple
 
+import warnings
+# [Patch] Add CPU-only fallback for missing CUDA libraries
+try:
+    import torch
+except OSError as e:  # pragma: no cover - env-specific
+    warnings.warn(
+        f"CUDA libraries not found ({e}), defaulting to CPU-only mode"
+    )
+
+    class _DummyCuda:
+        def is_available(self):
+            return False
+
+    class _DummyTorch:
+        cuda = _DummyCuda()
+
+    torch = _DummyTorch()
+
 import pandas as pd
 from src import features
 
@@ -214,3 +232,145 @@ def compute_trailing_atr_stop(
             return min(sl_old, entry)
 
     return old_sl
+
+def volatility_adjusted_lot_size(
+    equity: float,
+    atr_value: float,
+    sl_multiplier: float = 1.5,
+    pip_value: float = 0.1,
+    risk_pct: float = 0.01,
+    min_lot: float = 0.01,
+    max_lot: float = 5.0,
+) -> Tuple[float, float]:
+    """[Patch] Calculate lot size based on ATR volatility."""
+    try:
+        equity = float(equity)
+        atr_value = float(atr_value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid inputs for volatility_adjusted_lot_size")
+        return min_lot, float("nan")
+    if equity <= 0 or atr_value <= 0 or pip_value <= 0:
+        logger.warning("Non-positive inputs for volatility_adjusted_lot_size")
+        return min_lot, float("nan")
+    sl_pips = atr_value * sl_multiplier * 10.0
+    risk_amount = equity * risk_pct
+    risk_per_lot = sl_pips * pip_value
+    if risk_per_lot <= 1e-9:
+        return min_lot, atr_value * sl_multiplier
+    lot = round(risk_amount / risk_per_lot, 2)
+    lot = max(min_lot, min(lot, max_lot))
+    return lot, atr_value * sl_multiplier
+
+
+def dynamic_risk_adjustment(
+    fold_returns: list[float],
+    base_risk: float = 0.01,
+    loss_cutoff: float = -0.05,
+    win_cutoff: float = 0.05,
+) -> float:
+    """[Patch] Adjust risk based on consecutive fold performance."""
+    if not fold_returns:
+        return base_risk
+    last_three = fold_returns[-3:]
+    last_two = fold_returns[-2:]
+    if len(last_three) >= 2 and all(r <= loss_cutoff for r in last_three[-2:]):
+        return base_risk * 0.5
+    if len(last_three) == 3 and all(r <= loss_cutoff for r in last_three):
+        return base_risk * 0.5  # pragma: no cover
+    if len(last_two) == 2 and all(r >= win_cutoff for r in last_two):
+        return base_risk * 1.5
+    return base_risk
+
+
+def check_portfolio_stop(drawdown_pct: float, threshold: float = 0.10) -> bool:
+    """[Patch] Return True if trading should be suspended."""
+    try:
+        dd = float(drawdown_pct)
+    except (TypeError, ValueError):
+        logger.warning("Invalid drawdown_pct for portfolio stop")
+        return False
+    return dd >= threshold
+
+
+def calculate_dynamic_sl_tp(
+    atr: float,
+    win_rate: float,
+    sl_min_pips: float = 20.0,
+    sl_max_pips: float = 30.0,
+    atr_multiplier: float = 1.5,
+) -> Tuple[float, float]:
+    """Return SL/TP distances based on ATR and win rate.
+
+    - SL ใช้ค่าระหว่าง ``sl_min_pips`` ถึง ``sl_max_pips``
+      โดยอิงจาก ``atr * atr_multiplier`` ในหน่วยราคา
+    - TP จะปรับตาม ``win_rate``:
+      * ต่ำกว่า 40% ⇒ TP = 3×SL
+      * สูงกว่า 50% ⇒ TP = 1.5×SL
+      * อื่น ๆ ⇒ TP = 2×SL
+    """
+
+    try:
+        atr_val = float(atr)
+        wr = float(win_rate)
+    except (TypeError, ValueError):
+        logger.warning("Invalid inputs for calculate_dynamic_sl_tp")
+        return float("nan"), float("nan")
+
+    sl_by_atr = atr_val * atr_multiplier
+    sl_min = sl_min_pips / 10.0
+    sl_max = sl_max_pips / 10.0
+    sl = max(sl_min, min(sl_by_atr, sl_max))
+
+    if wr < 0.40:
+        tp_mult = 3.0
+    elif wr > 0.50:
+        tp_mult = 1.5
+    else:
+        tp_mult = 2.0
+
+    tp = sl * tp_mult
+    return sl, tp
+
+
+def update_signal_threshold(current_score: float, params) -> float:
+    """[Patch] Adjust ``signal_score_threshold`` based on ``current_score``.
+
+    หากมีการปรับค่าจะบันทึก Log รูปแบบ
+    ``[Adaptive] Threshold changed | Fold=<…> | Profile=<…> | Old=<…> -> New=<…> | Current Score=<…>``
+    """
+
+    try:
+        score = float(current_score)
+    except (TypeError, ValueError):
+        logger.warning("Invalid current_score for update_signal_threshold")
+        return params.signal_score_threshold
+
+    some_condition = score > 0.8
+    other_condition = score < 0.2
+
+    if some_condition:
+        old_th = params.signal_score_threshold
+        new_th = 0.50
+        params.signal_score_threshold = new_th
+        logger.info(
+            "[Adaptive] Threshold changed | Fold=%s | Profile=%s | Old=%s -> New=%s | Current Score=%.2f",
+            getattr(params, "current_fold", "N/A"),
+            getattr(params, "profile_name", "N/A"),
+            old_th,
+            new_th,
+            score,
+        )
+    elif other_condition:
+        old_th = params.signal_score_threshold
+        new_th = 0.25
+        params.signal_score_threshold = new_th
+        logger.info(
+            "[Adaptive] Threshold changed | Fold=%s | Profile=%s | Old=%s -> New=%s | Current Score=%.2f",
+            getattr(params, "current_fold", "N/A"),
+            getattr(params, "profile_name", "N/A"),
+            old_th,
+            new_th,
+            score,
+        )
+
+    return params.signal_score_threshold

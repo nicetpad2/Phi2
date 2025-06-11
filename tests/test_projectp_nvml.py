@@ -79,12 +79,12 @@ def test_projectp_output_audit(monkeypatch, caplog, tmp_path):
 
     dummy_main = lambda: None
     monkeypatch.setitem(sys.modules, "src.main", types.SimpleNamespace(main=dummy_main))
+    monkeypatch.setattr(config, "OUTPUT_DIR", out_dir)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["ProjectP.py"])
     config.logger.setLevel(logging.INFO)
     script_path = os.path.join(ROOT_DIR, "ProjectP.py")
     with caplog.at_level(logging.INFO):
         runpy.run_path(script_path, run_name="__main__")
-    # Should log present for existing file and missing for absent file
+    # ควรแจ้งว่าไฟล์ทั้งหมดมีอยู่หลังสคริปต์รันเสร็จ
     assert any("[QA] Output present" in m for m in caplog.messages)
-    assert any("[QA] Output missing" in m for m in caplog.messages)

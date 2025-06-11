@@ -44,7 +44,7 @@ def test_macd_with_dummy_ta(monkeypatch):
     line, signal, diff = features.macd(series, window_slow=5, window_fast=2, window_sign=2)
     assert line.iloc[-1] == series.iloc[-1]
     assert signal.iloc[-1] == series.iloc[-1] * 0.5
-    assert diff.iloc[-1] == series.iloc[-1] * 0.1
+    assert np.isclose(diff.iloc[-1], series.iloc[-1] * 0.1)
 
 
 def test_calculate_m15_trend_zone(monkeypatch):
@@ -96,6 +96,29 @@ def test_get_mtf_sma_trend():
     df = pd.DataFrame({'Close': [1.0, 2.0, 3.0]}, index=idx)
     trend = features.get_mtf_sma_trend(df, fast=1, slow=2, rsi_period=1, rsi_upper=70, rsi_lower=30)
     assert trend in {'UP', 'DOWN', 'NEUTRAL'}
+
+
+def test_calculate_m15_trend_zone_duplicate_index(monkeypatch, caplog):
+    idx = pd.date_range('2024-01-01', periods=3, freq='15min')
+    idx = idx.insert(1, idx[1])
+    df = pd.DataFrame({'Close': [1, 2, 2, 3]}, index=idx)
+
+    def fake_ema(series, period):
+        return pd.Series([1] * len(series), index=series.index, dtype='float32')
+
+    def fake_rsi(series, period):
+        return pd.Series([55] * len(series), index=series.index, dtype='float32')
+
+    monkeypatch.setattr(features, 'ema', fake_ema)
+    monkeypatch.setattr(features, 'rsi', fake_rsi)
+
+    with caplog.at_level(logging.INFO):
+        result = features.calculate_m15_trend_zone(df)
+
+    assert len(result) == len(df)
+    logs = " ".join(caplog.messages).lower()
+    assert "duplicate labels" in logs
+    assert "removed" in logs
 
 
 def test_calculate_m1_entry_signals():
@@ -196,3 +219,24 @@ def test_merge_wave_pattern_labels_missing(tmp_path):
                       index=pd.date_range('2024-01-01', periods=1, freq='1min'))
     res = features.merge_wave_pattern_labels(df, str(tmp_path / 'missing.csv'))
     assert res['Wave_Pattern'].iloc[0] == 'Unknown'
+
+
+def test_calculate_order_flow_imbalance_basic():
+    df = pd.DataFrame({'BuyVolume': [3.0, 1.0], 'SellVolume': [1.0, 1.0]})
+    res = features.calculate_order_flow_imbalance(df)
+    assert np.isclose(res.iloc[0], 0.5)
+    assert np.isclose(res.iloc[1], 0.0)
+
+
+def test_calculate_relative_volume_basic():
+    df = pd.DataFrame({'Volume': [1, 2, 3, 4, 5]}, index=pd.RangeIndex(5))
+    res = features.calculate_relative_volume(df, period=2)
+    vol_5m = df['Volume'].rolling(5, min_periods=1).sum()
+    expected = vol_5m / vol_5m.rolling(2, min_periods=1).mean()
+    pd.testing.assert_series_equal(res, expected.astype('float32'), check_names=False)
+
+
+def test_calculate_momentum_divergence_basic():
+    close = pd.Series([1, 2, 3, 4, 5], dtype='float32')
+    res = features.calculate_momentum_divergence(close)
+    assert len(res) == len(close)

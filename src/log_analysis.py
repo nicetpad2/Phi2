@@ -134,6 +134,38 @@ def calculate_drawdown_stats(df: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def calculate_expectancy(df: pd.DataFrame, pnl_col: str = "PnL") -> float:
+    """Return expectancy from a series of trade PnL values.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame ที่มีคอลัมน์กำไรขาดทุน
+    pnl_col : str, optional
+        ชื่อคอลัมน์ PnL ภายใน DataFrame
+
+    Returns
+    -------
+    float
+        ค่าคาดหวัง (Expectancy) ตามสูตร Win% * AvgWin - Loss% * AvgLoss
+    """
+
+    if df.empty or pnl_col not in df:
+        return 0.0
+
+    pnl = pd.to_numeric(df[pnl_col], errors="coerce").dropna()
+    if pnl.empty:
+        return 0.0
+
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl <= 0]
+    win_pct = len(wins) / len(pnl)
+    loss_pct = len(losses) / len(pnl)
+    avg_win = wins.mean() if not wins.empty else 0.0
+    avg_loss = abs(losses.mean()) if not losses.empty else 0.0
+    return float(win_pct * avg_win - loss_pct * avg_loss)
+
+
 def parse_alerts(log_path: str) -> pd.DataFrame:
     """[Patch] Extract warning/error/critical messages from a log file."""
     entries = []
@@ -189,4 +221,90 @@ def summarize_block_reasons(blocked_logs: list[dict]) -> pd.Series:
         return pd.Series(dtype=int)
     reasons = [b.get("reason", "UNKNOWN") for b in blocked_logs if isinstance(b, dict)]
     return pd.Series(reasons).value_counts()
+
+
+# [Patch v6.1.6] Equity curve and expectancy analysis utilities
+def calculate_equity_curve(df: pd.DataFrame, pnl_col: str = "PnL") -> pd.Series:
+    """Return cumulative equity from trade PnL."""
+    if df.empty or pnl_col not in df:
+        return pd.Series(dtype=float)
+    pnl = pd.to_numeric(df[pnl_col], errors="coerce").fillna(0)
+    return pnl.cumsum()
+
+
+def calculate_expectancy_by_period(
+    df: pd.DataFrame, period: str = "h", pnl_col: str = "PnL"
+) -> pd.Series:
+    """Return expectancy grouped by time period (e.g., hourly)."""
+    if df.empty or pnl_col not in df or "EntryTime" not in df:
+        return pd.Series(dtype=float)
+    df = df.dropna(subset=["EntryTime"]).copy()
+    df[pnl_col] = pd.to_numeric(df[pnl_col], errors="coerce")
+    df = df.dropna(subset=[pnl_col])
+
+    def _exp(x: pd.Series) -> float:
+        wins = x[x > 0]
+        losses = x[x <= 0]
+        win_rate = (wins.count() / len(x)) if len(x) else 0.0
+        avg_win = wins.mean() if not wins.empty else 0.0
+        avg_loss = abs(losses.mean()) if not losses.empty else 0.0
+        return float(win_rate * avg_win - (1 - win_rate) * avg_loss)
+
+    grouped = df.groupby(df["EntryTime"].dt.to_period(period.lower()))[pnl_col]
+    return grouped.apply(_exp)
+
+
+def plot_equity_curve(curve: pd.Series):
+    """Return a matplotlib Figure of the equity curve."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    curve.plot(ax=ax)
+    ax.set_xlabel("trade")
+    ax.set_ylabel("equity")
+    return fig
+
+
+# [Patch v6.1.8] Plot expectancy by period
+def plot_expectancy_by_period(exp: pd.Series):
+    """Return a matplotlib Figure of expectancy by period."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    exp.plot(kind="bar", ax=ax)
+    ax.set_xlabel("period")
+    ax.set_ylabel("expectancy")
+    return fig
+
+
+# [Patch v6.1.7] Full trade log summarization helper
+def summarize_trade_log(log_path: str) -> dict[str, object]:
+    """Parse log and return summary with equity curve."""
+    df = parse_trade_logs(log_path)
+    summary = compile_log_summary(df, log_path)
+    summary["equity_curve"] = calculate_equity_curve(df)
+    summary["expectancy_H"] = calculate_expectancy_by_period(df)
+    return summary
+
+
+# [Patch] Generate combined equity and expectancy plot
+def plot_trade_log_metrics(log_path: str):
+    """Return figure with equity curve and hourly expectancy."""
+    df = parse_trade_logs(log_path)
+    curve = calculate_equity_curve(df)
+    exp = calculate_expectancy_by_period(df)
+
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6))
+    curve.plot(ax=axes[0])
+    axes[0].set_xlabel("trade")
+    axes[0].set_ylabel("equity")
+
+    exp.plot(kind="bar", ax=axes[1])
+    axes[1].set_xlabel("period")
+    axes[1].set_ylabel("expectancy")
+
+    plt.tight_layout()
+    return fig
 

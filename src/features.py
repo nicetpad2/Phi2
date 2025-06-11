@@ -1,5 +1,7 @@
 # === START OF PART 5/12 ===
 
+"""Feature engineering helpers and technical indicator calculations."""
+
 # ==============================================================================
 # === PART 5: Feature Engineering & Indicator Calculation (v4.8.12) ===
 # ==============================================================================
@@ -14,19 +16,47 @@ import logging
 import pandas as pd
 import numpy as np
 # from data_loader import some_helper  # switched to absolute import (Patch v4.8.9)
-import ta # Assumes 'ta' is imported and available (checked in Part 1)
+try:  # [Patch v5.8.2] Handle missing ta library gracefully
+    import vendor.ta as ta
+    _TA_AVAILABLE = True
+except ImportError:  # pragma: no cover - environment may not have ta installed
+    class _DummySubmodule:
+        pass
+
+    class _DummyTA:
+        def __init__(self):
+            self.volatility = _DummySubmodule()
+            self.trend = _DummySubmodule()
+            self.momentum = _DummySubmodule()
+
+    ta = _DummyTA()
+    _TA_AVAILABLE = False
+    logging.warning("'ta' library not found. Technical indicators will return NaN.")
 from sklearn.cluster import KMeans # For context column calculation
 from sklearn.preprocessing import StandardScaler # For context column calculation
 import gc # For memory management
 from src.utils.gc_utils import maybe_collect
 from functools import lru_cache
 from src.utils.sessions import get_session_tag  # [Patch v5.1.3]
-from src.utils import get_env_float
+from src.utils import get_env_float, load_json_with_comments
 
 _rsi_cache = {}  # [Patch v4.8.12] Cache RSIIndicator per period
 _atr_cache = {}  # [Patch v4.8.12] Cache AverageTrueRange per period
 _sma_cache = {}  # [Patch v4.8.12] Cache SMA results
 _m15_trend_cache = {}
+
+
+def reset_indicator_caches() -> None:
+    """Clear cached indicator objects before each fold.
+
+    ใช้เรียกก่อนเริ่มแต่ละ fold ของ Walk-Forward Validation เพื่อป้องกัน
+    การปนเปื้อนข้อมูลข้ามรอบ (data leakage) จากตัวชี้วัดที่มี state ภายใน.
+    """
+
+    _rsi_cache.clear()
+    _atr_cache.clear()
+    _sma_cache.clear()
+    _m15_trend_cache.clear()
 
 # Ensure global configurations are accessible if run independently
 DEFAULT_ROLLING_Z_WINDOW_M1 = 300; DEFAULT_ATR_ROLLING_AVG_PERIOD = 50
@@ -124,37 +154,66 @@ def sma(series, period):
         return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
 
 def rsi(series, period=14):
-    if not isinstance(series, pd.Series): logging.error(f"RSI Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
+    if not isinstance(series, pd.Series):
+        logging.error(f"RSI Error: Input must be a pandas Series, got {type(series)}")
+        raise TypeError("Input must be a pandas Series.")
     # [Patch v4.8.12] Use module-level cache for RSIIndicator
+    # [Patch v5.8.1] Ensure insufficient data warning is logged even when 'ta' is missing
     if series.empty:
         logging.debug("RSI: Input series is empty, returning NaN-aligned series.")
         return pd.Series(np.nan, index=series.index, dtype='float32')
-    if 'ta' not in globals() or ta is None: logging.error("   (Error) RSI calculation failed: 'ta' library not loaded."); return pd.Series(np.nan, index=series.index, dtype='float32')  # pragma: no cover
-    # Convert to numeric and drop NaN/inf values
     series_numeric = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+    if not _TA_AVAILABLE or ta is None:
+        logging.warning("   (Warning) Using pandas fallback RSI because 'ta' library not loaded.")
+        if series_numeric.empty or len(series_numeric) < period:
+            logging.warning(
+                f"   (Warning) RSI calculation skipped: Not enough valid data points ({len(series_numeric)} < {period})."
+            )
+            return pd.Series(np.nan, index=series.index, dtype='float32')
+        delta = series_numeric.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        avg_loss_safe = avg_loss.replace(0, np.nan)
+        rs = avg_gain / avg_loss_safe
+        rsi_series = (100 - 100 / (1 + rs)).fillna(100)
+        return rsi_series.reindex(series.index).ffill().astype('float32')
+    ta_loaded = 'ta' in globals() and ta is not None
+    if not ta_loaded:
+        logging.error("   (Error) RSI calculation failed: 'ta' library not loaded.")
     if series_numeric.empty or len(series_numeric) < period:
         logging.warning(
             f"   (Warning) RSI calculation skipped: Not enough valid data points ({len(series_numeric)} < {period})."
         )
         return pd.Series(np.nan, index=series.index, dtype='float32')
+    if not ta_loaded:
+        return pd.Series(np.nan, index=series.index, dtype='float32')
     # [Patch v5.5.16] Consolidate duplicate timestamps using last occurrence
     if series_numeric.index.duplicated().any():
         series_numeric = series_numeric.groupby(series_numeric.index).last()
-    try:
-        cache_key = period
-        if cache_key not in _rsi_cache:
-            _rsi_cache[cache_key] = ta.momentum.RSIIndicator(close=series_numeric, window=period, fillna=False)
-        else:
-            _rsi_cache[cache_key]._close = series_numeric
-        rsi_series = _rsi_cache[cache_key].rsi()
-        # Reindex to original index with forward-fill
-        rsi_final = rsi_series.reindex(series.index, method='ffill').astype('float32')
-        del series_numeric, rsi_series
-        maybe_collect()
-        return rsi_final
-    except Exception as e:
-        logging.error(f"   (Error) RSI calculation error for period {period}: {e}.", exc_info=True)
-        return pd.Series(np.nan, index=series.index, dtype='float32')
+    cache_key = period
+    use_ta = hasattr(ta, 'momentum') and hasattr(ta.momentum, 'RSIIndicator')
+    if use_ta:
+        try:
+            if cache_key not in _rsi_cache:
+                _rsi_cache[cache_key] = ta.momentum.RSIIndicator(close=series_numeric, window=period, fillna=False)
+            else:
+                _rsi_cache[cache_key]._close = series_numeric
+            rsi_series = _rsi_cache[cache_key].rsi()
+        except Exception as e:
+            logging.error(f"   (Error) RSI calculation error for period {period}: {e}.", exc_info=True)
+            return pd.Series(np.nan, index=series.index, dtype='float32')
+    else:
+        _rsi_cache.setdefault(cache_key, object())
+        delta = series_numeric.diff(); gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        rsi_series = 100 - (100 / (1 + (avg_gain / avg_loss.replace(0, np.nan))))
+    rsi_final = rsi_series.reindex(series.index).ffill().astype('float32')
+    del series_numeric, rsi_series
+    maybe_collect()
+    return rsi_final
 
 def atr(df_in, period=14):
     if not isinstance(df_in, pd.DataFrame): logging.error(f"ATR Error: Input must be a pandas DataFrame, got {type(df_in)}"); raise TypeError("Input must be a pandas DataFrame.")
@@ -220,21 +279,48 @@ def calculate_rsi(symbol: str, timeframe: str, length: int, date: str, prices: t
     return rsi(series, period=length)
 
 def macd(series, window_slow=26, window_fast=12, window_sign=9):
-    if not isinstance(series, pd.Series): logging.error(f"MACD Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
-    if series.empty: nan_series = pd.Series(dtype='float32'); return nan_series, nan_series.copy(), nan_series.copy()
-    nan_series_indexed = pd.Series(np.nan, index=series.index, dtype='float32')
-    if len(series.dropna()) < window_slow: logging.debug(f"MACD: Input series too short after dropna ({len(series.dropna())} < {window_slow})."); return nan_series_indexed, nan_series_indexed.copy(), nan_series_indexed.copy()
-    if 'ta' not in globals() or ta is None: logging.error("   (Error) MACD calculation failed: 'ta' library not loaded."); return nan_series_indexed, nan_series_indexed.copy(), nan_series_indexed.copy()
-    series_numeric = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
-    if series_numeric.empty or len(series_numeric) < window_slow: logging.warning(f"   (Warning) MACD calculation skipped: Not enough valid data points ({len(series_numeric)} < {window_slow})."); return nan_series_indexed, nan_series_indexed.copy(), nan_series_indexed.copy()
-    try:
-        macd_indicator = ta.trend.MACD(close=series_numeric, window_slow=window_slow, window_fast=window_fast, window_sign=window_sign, fillna=False)
-        macd_line_final = macd_indicator.macd().reindex(series.index).ffill().astype('float32')
-        macd_signal_final = macd_indicator.macd_signal().reindex(series.index).ffill().astype('float32')
-        macd_diff_final = macd_indicator.macd_diff().reindex(series.index).ffill().astype('float32')
-        del series_numeric, macd_indicator; maybe_collect()
-        return (macd_line_final, macd_signal_final, macd_diff_final)
-    except Exception as e: logging.error(f"   (Error) MACD calculation error: {e}.", exc_info=True); return nan_series_indexed, nan_series_indexed.copy(), nan_series_indexed.copy()
+    if not isinstance(series, pd.Series):
+        logging.error(f"MACD Error: Input must be a pandas Series, got {type(series)}")
+        raise TypeError("Input must be a pandas Series.")
+    if series.empty:
+        n = pd.Series(dtype='float32'); return n, n.copy(), n.copy()
+    nan = pd.Series(np.nan, index=series.index, dtype='float32')
+    if len(series.dropna()) < window_slow:
+        logging.debug(f"MACD: Input series too short after dropna ({len(series.dropna())} < {window_slow}).")
+        return nan, nan.copy(), nan.copy()
+    s = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+    if not _TA_AVAILABLE or ta is None:
+        logging.warning("   (Warning) Using pandas fallback MACD because 'ta' library not loaded.")
+        if s.empty or len(s) < window_slow:
+            logging.warning(
+                f"   (Warning) MACD calculation skipped: Not enough valid data points ({len(s)} < {window_slow})."
+            )
+            return nan, nan.copy(), nan.copy()
+        ema_fast = s.ewm(span=window_fast, adjust=False, min_periods=1).mean()
+        ema_slow = s.ewm(span=window_slow, adjust=False, min_periods=1).mean()
+        line = ema_fast - ema_slow
+        signal = line.ewm(span=window_sign, adjust=False, min_periods=1).mean()
+        diff = line - signal
+    else:
+        if s.empty or len(s) < window_slow:
+            logging.warning(
+                f"   (Warning) MACD calculation skipped: Not enough valid data points ({len(s)} < {window_slow})."
+            )
+            return nan, nan.copy(), nan.copy()
+        try:
+            ind = ta.trend.MACD(close=s, window_slow=window_slow, window_fast=window_fast, window_sign=window_sign, fillna=False)
+            line = ind.macd()
+            signal = ind.macd_signal()
+            diff = ind.macd_diff()
+        except Exception as e:
+            logging.error(f"   (Error) MACD calculation error: {e}.", exc_info=True)
+            return nan, nan.copy(), nan.copy()
+    macd_line_final = line.reindex(series.index).ffill().astype('float32')
+    macd_signal_final = signal.reindex(series.index).ffill().astype('float32')
+    macd_diff_final = diff.reindex(series.index).ffill().astype('float32')
+    del s, line, signal, diff
+    maybe_collect()
+    return macd_line_final, macd_signal_final, macd_diff_final
 
 def detect_macd_divergence(prices: pd.Series, macd_hist: pd.Series, lookback: int = 20) -> str:
     """ตรวจจับภาวะ Divergence อย่างง่ายระหว่างราคากับ MACD histogram
@@ -284,6 +370,82 @@ def detect_macd_divergence(prices: pd.Series, macd_hist: pd.Series, lookback: in
             return "bear"
 
     return "none"
+
+# [Patch v5.7.9] New feature helpers
+def calculate_order_flow_imbalance(df: pd.DataFrame) -> pd.Series:
+    """คำนวณความไม่สมดุลของ Order Flow"""
+    if not isinstance(df, pd.DataFrame) or not {"BuyVolume", "SellVolume"}.issubset(df.columns):
+        return pd.Series(0.0, index=getattr(df, "index", None), dtype="float32")
+    buy = pd.to_numeric(df["BuyVolume"], errors="coerce").fillna(0.0)
+    sell = pd.to_numeric(df["SellVolume"], errors="coerce").fillna(0.0)
+    total = buy + sell
+    imbalance = np.where(total > 0, (buy - sell) / total, 0.0)
+    return pd.Series(imbalance, index=df.index, dtype="float32")
+
+
+def calculate_relative_volume(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """คำนวณ Relative Volume จากปริมาณซื้อขายแบบรวม 5 แท่ง"""
+    if not isinstance(df, pd.DataFrame) or "Volume" not in df.columns:
+        return pd.Series(0.0, index=getattr(df, "index", None), dtype="float32")
+    vol_5m = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0).rolling(5, min_periods=1).sum()
+    avg_vol = vol_5m.rolling(period, min_periods=1).mean()
+    rel = np.where(avg_vol > 0, vol_5m / avg_vol, 0.0)
+    return pd.Series(rel, index=df.index, dtype="float32", name=df["Volume"].name)
+
+
+def calculate_momentum_divergence(close_series: pd.Series) -> pd.Series:
+    """คำนวณ Momentum Divergence ระหว่าง MACD บน M1 และค่าเฉลี่ย 5 แท่ง"""
+    if not isinstance(close_series, pd.Series) or close_series.empty:
+        return pd.Series(0.0, index=getattr(close_series, "index", None), dtype="float32")
+    m1_hist = macd(close_series)[2]
+    m5_close = close_series.rolling(5, min_periods=1).mean()
+    m5_hist = macd(m5_close)[2]
+    div = (m1_hist - m5_hist).astype("float32")
+    return div.reindex(close_series.index).fillna(0.0)
+
+
+def volatility_filter(df: pd.DataFrame, period: int = 14, window: int = 50) -> pd.Series:
+    """Return True when current ATR >= rolling mean ATR of recent bars."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be a pandas DataFrame")
+    col = f"ATR_{period}"
+    if col not in df.columns and {"High", "Low", "Close"}.issubset(df.columns):
+        df = df.join(atr(df[["High", "Low", "Close"]], period)[[col]])
+    if col not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+    atr_series = pd.to_numeric(df[col], errors="coerce")
+    mean_series = atr_series.rolling(window, min_periods=1).mean()
+    return (atr_series >= mean_series).fillna(False)
+
+
+def median_filter(series: pd.Series, window: int = 3) -> pd.Series:
+    """Apply simple rolling median filter."""
+    if not isinstance(series, pd.Series):
+        raise TypeError("Input must be a pandas Series")
+    return series.rolling(window, min_periods=1).median()
+
+
+def bar_range_filter(df: pd.DataFrame, threshold: float) -> pd.Series:
+    """Return True when bar range >= threshold."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be a pandas DataFrame")
+    if not {"High", "Low"}.issubset(df.columns):
+        return pd.Series(False, index=df.index, dtype=bool)
+    high = pd.to_numeric(df["High"], errors="coerce")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+    bar_range = high - low
+    return (bar_range >= threshold).fillna(False)
+
+
+def volume_filter(df: pd.DataFrame, window: int = 20, factor: float = 0.7, column: str = "Volume") -> pd.Series:
+    """Return True when volume >= rolling average * factor."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be a pandas DataFrame")
+    if column not in df.columns:
+        return pd.Series(True, index=df.index, dtype=bool)
+    vol = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+    avg = vol.rolling(window, min_periods=1).mean()
+    return (vol >= avg * factor).fillna(False)
 
 def rolling_zscore(series, window, min_periods=None):
     if not isinstance(series, pd.Series): logging.error(f"Rolling Z-Score Error: Input must be a pandas Series, got {type(series)}"); raise TypeError("Input must be a pandas Series.")
@@ -352,6 +514,15 @@ def calculate_m15_trend_zone(df_m15):
             _m15_trend_cache[cache_key] = result_df
         return result_df
     df = df_m15.copy()
+    if df.index.duplicated().any():
+        dup_count = int(df.index.duplicated().sum())
+        logging.warning(
+            "(Warning) พบ duplicate labels ใน index M15, กำลังลบซ้ำ..."
+        )  # [Patch v5.8.3]
+        df = df[~df.index.duplicated(keep='last')]
+        logging.info(
+            f"      Removed {dup_count} duplicate rows from M15 index."
+        )
     try:
         df["Close"] = pd.to_numeric(df["Close"], errors='coerce')
         if df["Close"].isnull().all():
@@ -487,10 +658,31 @@ def engineer_m1_features(df_m1, timeframe_minutes=TIMEFRAME_MINUTES_M1, lag_feat
         if 'cluster' in df.columns: df['cluster']=pd.to_numeric(df['cluster'],downcast='integer')
     if 'spike_score' not in df.columns:
         try:
-            gain_z_abs=abs(pd.to_numeric(df.get('Gain_Z',0.0),errors='coerce').fillna(0.0)); wick_ratio=pd.to_numeric(df.get('Wick_Ratio',0.0),errors='coerce').fillna(0.0)
-            atr_val=pd.to_numeric(df.get('ATR_14',1.0),errors='coerce').fillna(1.0).replace([np.inf,-np.inf],1.0)
-            score=(wick_ratio*0.5+gain_z_abs*0.3+atr_val*0.2); score=np.where((atr_val>1.5)&(wick_ratio>0.6),score*1.2,score); df['spike_score']=score.clip(0,1).astype('float32')
-        except Exception as e_spike: df['spike_score']=0.0; logging.error(f"         (Error) Spike score calculation failed: {e_spike}.",exc_info=True)
+            gain_z_abs = abs(pd.to_numeric(df.get('Gain_Z', 0.0), errors='coerce').fillna(0.0))
+            wick_ratio = pd.to_numeric(df.get('Wick_Ratio', 0.0), errors='coerce').fillna(0.0)
+            atr_val = pd.to_numeric(df.get('ATR_14', 1.0), errors='coerce').fillna(1.0).replace([np.inf, -np.inf], 1.0)
+            score = (wick_ratio * 0.5 + gain_z_abs * 0.3 + atr_val * 0.2)
+            score = np.where((atr_val > 1.5) & (wick_ratio > 0.6), score * 1.2, score)
+            df['spike_score'] = score.clip(0, 1).astype('float32')
+        except Exception as e_spike:
+            df['spike_score'] = 0.0
+            logging.error(f"         (Error) Spike score calculation failed: {e_spike}.", exc_info=True)
+
+    # [Patch v5.7.9] additional engineered features
+    if {'BuyVolume', 'SellVolume'}.issubset(df.columns):
+        df['OF_Imbalance'] = calculate_order_flow_imbalance(df)
+    else:
+        df['OF_Imbalance'] = 0.0
+
+    if 'Close' in df.columns:
+        df['Momentum_Divergence'] = calculate_momentum_divergence(df['Close'])
+    else:
+        df['Momentum_Divergence'] = 0.0
+
+    if 'Volume' in df.columns:
+        df['Relative_Volume'] = calculate_relative_volume(df)
+    else:
+        df['Relative_Volume'] = 0.0
     if 'session' not in df.columns:
         logging.info("      Creating 'session' column...")
         try:
@@ -525,7 +717,7 @@ def clean_m1_data(df_m1):  # pragma: no cover
     if not isinstance(df_m1, pd.DataFrame): logging.error("Clean M1 Data Error: Input must be a pandas DataFrame."); raise TypeError("Input must be a pandas DataFrame.")
     if df_m1.empty: logging.warning("   (Warning) ข้ามการทำความสะอาดข้อมูล M1: DataFrame ว่างเปล่า."); return pd.DataFrame(), []
     df_cleaned = df_m1.copy()
-    potential_m1_features = ["Candle_Body", "Candle_Range", "Candle_Ratio", "Gain", "Gain_Z", "MACD_line", "MACD_signal", "MACD_hist", "MACD_hist_smooth", "ATR_14", "ATR_14_Shifted", "ATR_14_Rolling_Avg", "Candle_Speed", "Wick_Length", "Wick_Ratio", "Pattern_Label", "Signal_Score", 'Volatility_Index', 'ADX', 'RSI', 'cluster', 'spike_score', 'session']
+    potential_m1_features = ["Candle_Body", "Candle_Range", "Candle_Ratio", "Gain", "Gain_Z", "MACD_line", "MACD_signal", "MACD_hist", "MACD_hist_smooth", "ATR_14", "ATR_14_Shifted", "ATR_14_Rolling_Avg", "Candle_Speed", "Wick_Length", "Wick_Ratio", "Pattern_Label", "Signal_Score", 'Volatility_Index', 'ADX', 'RSI', 'cluster', 'spike_score', 'OF_Imbalance', 'Momentum_Divergence', 'Relative_Volume', 'session']
     lag_cols_in_df = [col for col in df_cleaned.columns if '_lag' in col]
     potential_m1_features.extend(lag_cols_in_df)
     if META_CLASSIFIER_FEATURES: potential_m1_features.extend([f for f in META_CLASSIFIER_FEATURES if f not in potential_m1_features])
@@ -633,7 +825,7 @@ except ImportError:
 
 # Ensure global configurations are accessible if run independently
 # Define defaults if globals are not found
-DEFAULT_META_MIN_PROBA_THRESH = 0.5
+DEFAULT_META_MIN_PROBA_THRESH = 0.25
 DEFAULT_ENABLE_OPTUNA_TUNING = True
 DEFAULT_OPTUNA_N_TRIALS = 50
 DEFAULT_OPTUNA_CV_SPLITS = 5
@@ -645,6 +837,7 @@ DEFAULT_META_CLASSIFIER_FEATURES = [
     "Gain_Z_lag1", "Gain_Z_lag3", "Gain_Z_lag5",
     "Candle_Speed_lag1", "Candle_Speed_lag3", "Candle_Speed_lag5",
     "cluster", "spike_score", "Pattern_Label",
+    "OF_Imbalance", "Momentum_Divergence", "Relative_Volume",
 ]
 # <<< [Patch] Added default for Meta-Meta threshold >>>
 DEFAULT_META_META_MIN_PROBA_THRESH = 0.5
@@ -1256,8 +1449,7 @@ def load_features_for_model(model_name, output_dir):  # pragma: no cover
                 return DEFAULT_META_CLASSIFIER_FEATURES
 
     try:
-        with open(features_file_path, 'r', encoding='utf-8') as f:
-            features = json.load(f)
+        features = load_json_with_comments(features_file_path)
         if isinstance(features, list) and all(isinstance(feat, str) for feat in features):
             logging.info(f"      (Success) Loaded {len(features)} features for model '{model_name}' from '{os.path.basename(features_file_path)}'.")
             return features
@@ -1410,6 +1602,26 @@ def load_features_hdf5(path):
         logging.error(f"(Features) Failed to load features from {path}: {e}", exc_info=True)
         return None
 
+# [Patch vX.Y.Z] Parquet helpers for faster feature loading
+def save_features_parquet(df: pd.DataFrame, path: str) -> None:
+    """Save a DataFrame to a Parquet file."""
+    try:
+        df.to_parquet(path)
+        logging.info(f"(Features) Saved features to {path}")
+    except Exception as e:
+        logging.error(f"(Features) Failed to save features to {path}: {e}", exc_info=True)
+
+
+def load_features_parquet(path: str) -> pd.DataFrame | None:
+    """Load a DataFrame from a Parquet file."""
+    try:
+        df = pd.read_parquet(path)
+        logging.info(f"(Features) Loaded features from {path}")
+        return df
+    except Exception as e:
+        logging.error(f"(Features) Failed to load features from {path}: {e}", exc_info=True)
+        return None
+
 # --- Advanced Feature Utilities -------------------------------------------------
 # [Patch v5.6.5] Add momentum, cumulative delta, and wave pattern helpers
 
@@ -1476,5 +1688,74 @@ def merge_wave_pattern_labels(df, log_path):
     )
     df_out['Wave_Pattern'] = merged['pattern_label'].fillna('Unknown').astype('category')
     return df_out
+
+
+# [Patch v6.1.7] Engulfing candlestick pattern tagging
+def tag_engulfing_patterns(df: pd.DataFrame) -> pd.DataFrame:
+    """Label bullish/bearish engulfing patterns."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be DataFrame")
+    df_out = df.copy()
+    if not {"Open", "Close"}.issubset(df_out.columns):
+        logging.warning("(Warning) Missing Open/Close for engulfing pattern")
+        df_out["Engulfing"] = "None"
+        df_out["Engulfing"] = df_out["Engulfing"].astype("category")
+        return df_out
+
+    open_p = pd.to_numeric(df_out["Open"], errors="coerce")
+    close_p = pd.to_numeric(df_out["Close"], errors="coerce")
+    prev_open = open_p.shift(1)
+    prev_close = close_p.shift(1)
+    bullish = (
+        (prev_close < prev_open)
+        & (close_p > open_p)
+        & (close_p >= prev_open)
+        & (open_p <= prev_close)
+    )
+    bearish = (
+        (prev_close > prev_open)
+        & (close_p < open_p)
+        & (close_p <= prev_open)
+        & (open_p >= prev_close)
+    )
+    df_out["Engulfing"] = np.select(
+        [bullish, bearish], ["Bullish", "Bearish"], default="None"
+    )
+    df_out["Engulfing"] = df_out["Engulfing"].astype("category")
+    return df_out
+
+
+__all__ = [
+    "ema",
+    "sma",
+    "rsi",
+    "atr",
+    "calculate_sma",
+    "calculate_rsi",
+    "macd",
+    "detect_macd_divergence",
+    "calculate_order_flow_imbalance",
+    "calculate_relative_volume",
+    "calculate_momentum_divergence",
+    "volatility_filter",
+    "median_filter",
+    "bar_range_filter",
+    "volume_filter",
+    "reset_indicator_caches",
+    "rolling_zscore",
+    "tag_price_structure_patterns",
+    "tag_engulfing_patterns",
+    "calculate_m15_trend_zone",
+    "get_mtf_sma_trend",
+    "engineer_m1_features",
+    "clean_m1_data",
+    "calculate_m1_entry_signals",
+    "select_top_shap_features",
+    "check_model_overfit",
+    "check_feature_noise_shap",
+    "analyze_feature_importance_shap",
+    "save_features_parquet",
+    "load_features_parquet",
+]
 
 

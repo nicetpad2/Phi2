@@ -1,3 +1,5 @@
+# รายชื่อฟีเจอร์หลักสำหรับ MetaClassifier
+# เวอร์ชันล่าสุด 5.8.5
 [
   "RSI",
   "MACD_hist_smooth",
@@ -16,5 +18,8 @@
   "Candle_Speed_lag5",
   "cluster",
   "spike_score",
-  "Pattern_Label"
+  "Pattern_Label",
+  "OF_Imbalance",
+  "Momentum_Divergence",
+  "Relative_Volume"
 ]

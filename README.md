@@ -1,15 +1,53 @@
 # Phiradon168
 
-คำแนะนำการติดตั้ง
--------------------
+[![CI](https://github.com/Phiradon168/Phiradon168/actions/workflows/ci.yml/badge.svg)](https://github.com/Phiradon168/Phiradon168/actions) [![Coverage](https://codecov.io/gh/Phiradon168/Phiradon168/branch/main/graph/badge.svg)](https://codecov.io/gh/Phiradon168/Phiradon168) [![PyPI version](https://img.shields.io/pypi/v/phiradon168.svg)](https://pypi.org/project/phiradon168/)
+
+## Overview
+ระบบ NICEGOLD Enterprise ใช้เทรดและวิเคราะห์ XAUUSD บนกรอบเวลา M1 รองรับทั้งการทดสอบย้อนหลังและ Walk-Forward Validation
+
+## Prerequisites
+- Python 3.8-3.10
+- ติดตั้งไลบรารีด้วย `pip install -r requirements.txt`
+- กำหนดตัวแปรสภาพแวดล้อมผ่านไฟล์ `.env` (ดูตัวอย่าง `.env.example`)
+
+## Features
+- ระบบมีตัวกรอง ATR และ Median เพื่อช่วยลด Noise ในกรอบเวลา M1
+
+## Installation
+```bash
+git clone <repo-url>
+cd Phiradon168
+pip install -r requirements.txt
+```
+
+## Usage
+```bash
+python main.py --mode backtest
+python ProjectP.py --mode all
+```
+
+## Project Structure
+- src/: โค้ดหลักและโมดูลต่าง ๆ
+- config/: ไฟล์ตั้งค่า (`pipeline.yaml`)
+- tuning/: สคริปต์หาค่า hyperparameter
+- tests/: ชุดทดสอบอัตโนมัติ
+- docs/: เอกสารประกอบ
+- logs/<date>/<fold>/: log แยกตามวันที่และ fold
+
+## Contribution Guidelines
+- ชื่อ branch: `feature/<desc>` หรือ `hotfix/<issue>`
+- commit message รูปแบบ `[Patch vX.Y.Z] <ข้อความสั้น>`
+- รัน `pytest -q` และจัดรูปแบบโค้ดด้วย PEP8/Black
+
+### คำแนะนำการติดตั้งเพิ่มเติม
 1. สร้าง virtualenv และติดตั้งไลบรารีหลัก:
    ```bash
    pip install -r requirements.txt
    ```
 ### Dependencies
-- Python 3.9+
+- Python 3.8-3.10
 - pandas>=2.2.2
-- numpy>=2.0
+- numpy<2.0
 - scikit-learn>=1.6.1
 - catboost>=1.2.8
 
@@ -22,7 +60,7 @@
 - `tuning/` สคริปต์ค้นหา Hyperparameter
 - `tests/` ชุดทดสอบอัตโนมัติ
 - `docs/` เอกสารประกอบ
-- `logs/` ผลการรันและบันทึกต่าง ๆ
+- `logs/<date>/<fold>/` โฟลเดอร์บันทึก log แยกตามวันที่และ fold
 
 ## การใช้งานสคริปต์หลัก
 - `python ProjectP.py` เตรียมข้อมูลพื้นฐานและรันขั้นตอนหลัก
@@ -31,6 +69,9 @@
 - `python main.py --stage backtest` รัน backtest พร้อม config ใน `config/pipeline.yaml`
 - `python main.py --stage all` ทำ Walk-Forward Validation ทั้งชุด
 - `python profile_backtest.py <CSV>` วิเคราะห์คอขวดประสิทธิภาพ
+- `python qa_output_default.py` สรุปรายงานไฟล์ QA ใน `output_default`
+- `python scripts/validate_features.py features_main.json` ตรวจสอบรายชื่อฟีเจอร์
+- `streamlit run src/realtime_dashboard.py -- --log_path <log.csv>` เปิดแดชบอร์ดเรียลไทม์
 ## การตั้งค่า config.yaml
 ไฟล์ `config/pipeline.yaml` ใช้กำหนดค่าพื้นฐานของ pipeline เช่นระดับ log และโฟลเดอร์โมเดล
 ตัวอย่างค่าเริ่มต้น:
@@ -59,6 +100,10 @@ python ProjectP.py
 python profile_backtest.py XAUUSD_M1.csv --rows 10000 --limit 30 --output profile.txt --output-file backtest.prof
 ```
 คำสั่งด้านบนจะแสดง 30 ฟังก์ชันที่ใช้เวลามากที่สุดตามค่า `cumtime` จาก `cProfile` และบันทึกผลไว้ใน `profile.txt` รวมทั้งไฟล์ `backtest.prof` สำหรับเปิดใน SnakeViz.
+หากต้องการเก็บไฟล์ profiling แยกตามแต่ละรอบ ให้ระบุโฟลเดอร์ผ่าน `--output-profile-dir` ดังนี้:
+```bash
+python profile_backtest.py XAUUSD_M1.csv --output-profile-dir profiles
+```
 นอกจากนี้ยังสามารถระบุชื่อ Fund Profile และสั่งให้ฝึกโมเดลหลังจบการทดสอบได้ดังนี้:
 ```bash
 python profile_backtest.py XAUUSD_M1.csv --fund AGGRESSIVE --train --train-output models
@@ -148,16 +193,23 @@ from src.log_analysis import (
     plot_summary,
 )
 
-logs_df = parse_trade_logs('logs')
+logs_df = parse_trade_logs('logs/2025-06-05/fold1/gold_ai_v5.8.2_qa.log')
 summary = calculate_hourly_summary(logs_df)
 print(summary)
 reason_stats = calculate_reason_summary(logs_df)
 duration = calculate_duration_stats(logs_df)
 drawdown = calculate_drawdown_stats(logs_df)
-alerts = calculate_alert_summary('logs')
+alerts = calculate_alert_summary('logs/2025-06-05/fold1/gold_ai_v5.8.2_qa.log')
 export_summary_to_csv(summary.reset_index(), 'summary.csv.gz')
 fig = plot_summary(summary)
 fig.savefig('summary.png')
 ```
 ฟังก์ชัน `calculate_position_size` ยังช่วยคำนวณขนาดลอตที่เหมาะสมตามทุนและระยะ SL
 
+Updated for patch 5.8.5.
+
+Patch 5.7.8 resolves font configuration parsing errors when plotting.
+
+
+## Vendored Libraries
+โฟลเดอร์ `vendor/ta/` นำโค้ดไลบรารี ta เวอร์ชัน 0.11.0 มารวมไว้เป็นสำรอง หากไม่ต้องการสามารถติดตั้ง `ta` จาก PyPI และลบโฟลเดอร์นี้ได้

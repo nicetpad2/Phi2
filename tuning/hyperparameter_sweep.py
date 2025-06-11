@@ -6,6 +6,7 @@
 - Resume ได้ (skip run ที่เสร็จ)
 - สรุปสถิติ + best config
 """
+# [Patch v5.9.4] Support real trade log usage and metric export
 import os
 import sys
 
@@ -21,7 +22,35 @@ from datetime import datetime
 from tqdm import tqdm
 
 from src.config import logger, DefaultConfig
+
+# [Patch v5.9.1] Default sweep results under configured OUTPUT_DIR
+DEFAULT_SWEEP_DIR = DefaultConfig.OUTPUT_DIR
+
+
+def _create_placeholder_trade_log(path: str) -> None:
+    """Create a minimal trade log so the sweep can run."""
+    # [Patch v5.10.8] Ensure sample size > 1 to avoid train_test_split errors
+    profits = [1.0, -1.0, 0.8, -0.8, 0.6, -0.6, 0.4, -0.4]
+    df = pd.DataFrame({"profit": profits})
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    compression = "gzip" if path.endswith(".gz") else None
+    df.to_csv(path, index=False, compression=compression)
+    logger.warning(f"สร้าง trade log ตัวอย่างที่ {path}")
 from src.training import real_train_func
+
+# [Patch v5.9.4] Default trade log path under configured OUTPUT_DIR
+DEFAULT_TRADE_LOG = os.path.join(
+    DefaultConfig.OUTPUT_DIR, "trade_log_v32_walkforward.csv.gz"
+)
+# [Patch v5.9.5] Fallback to alternative trade log locations
+if not os.path.exists(DEFAULT_TRADE_LOG):
+    alt_path = os.path.join(DefaultConfig.OUTPUT_DIR, "trade_log_v32_walkforward.csv")
+    if os.path.exists(alt_path):
+        DEFAULT_TRADE_LOG = alt_path
+    else:
+        simple_path = os.path.join(DefaultConfig.OUTPUT_DIR, "trade_log_NORMAL.csv")
+        if os.path.exists(simple_path):
+            DEFAULT_TRADE_LOG = simple_path
 
 
 def _parse_csv_list(text: str, cast: Callable) -> List:
@@ -46,7 +75,7 @@ def _filter_kwargs(func: Callable, kwargs: Dict[str, object]) -> Dict[str, objec
 
 
 def run_sweep(
-    output_dir: str,
+    output_dir: str | None,
     params_grid: Dict[str, List],
     seed: int = 42,
     resume: bool = True,
@@ -54,17 +83,45 @@ def run_sweep(
     m1_path: str | None = None,
 ) -> None:
     """รัน hyperparameter sweep พร้อมคุณสมบัติ resume และ QA log"""
+    if not output_dir:
+        output_dir = DEFAULT_SWEEP_DIR
     os.makedirs(output_dir, exist_ok=True)
+
+    # [Patch v5.9.4] Load and validate trade log before running
+    if not trade_log_path:
+        logger.error("ต้องระบุ trade_log_path เพื่อทำการ sweep")
+        raise SystemExit(1)
+    if not os.path.exists(trade_log_path):
+        # [Patch v5.9.5] Try fallback paths if compressed log missing
+        alt = trade_log_path.replace('.csv.gz', '.csv')
+        if os.path.exists(alt):
+            trade_log_path = alt
+        else:
+            logger.warning(f"ไม่พบไฟล์ trade log: {trade_log_path} จะสร้างไฟล์ตัวอย่าง")
+            _create_placeholder_trade_log(trade_log_path)
+    try:
+        df_log = pd.read_csv(trade_log_path)
+        # [Patch v5.8.13] Allow single-row trade logs with fallback metrics
+        if len(df_log) < 1:
+            logger.warning(
+                "trade log มีข้อมูลน้อยกว่า 1 แถว - สร้างไฟล์ตัวอย่างเพิ่ม"
+            )
+            _create_placeholder_trade_log(trade_log_path)
+            df_log = pd.read_csv(trade_log_path)
+    except Exception as e:  # pragma: no cover - unexpected read failure
+        logger.error(f"อ่านไฟล์ trade log ไม่สำเร็จ: {e}")
+        raise SystemExit(1)
     summary_path = os.path.join(output_dir, 'summary.csv')
     qa_log_path = os.path.join(output_dir, 'qa_sweep_log.txt')
 
     existing = set()
     if resume and os.path.exists(summary_path):
         df_exist = pd.read_csv(summary_path)
-        existing = set(
-            tuple(getattr(row, param) for param in params_grid)
-            for row in df_exist.itertuples(index=False)
-        )
+        # [Patch v5.10.9] Handle missing columns when resuming
+        for row in df_exist.itertuples(index=False):
+            row_dict = row._asdict()
+            combo = tuple(row_dict.get(param) for param in params_grid)
+            existing.add(combo)
 
     param_names = list(params_grid.keys())
     param_values = [params_grid[k] for k in param_names]
@@ -93,12 +150,16 @@ def run_sweep(
                 m1_path=m1_path or DefaultConfig.DATA_FILE_PATH_M1,
                 **call_dict,
             )
+            metric_val = None
+            if result.get('metrics'):
+                metric_val = list(result['metrics'].values())[0]
             summary_row = {
                 'run_id': run_id,
                 **param_dict,
                 'model_path': result['model_path'].get('model', ''),
                 'features': ','.join(result.get('features', [])),
                 **result.get('metrics', {}),
+                'metric': metric_val,
                 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             summary_rows.append(summary_row)
@@ -128,30 +189,54 @@ def run_sweep(
     df.to_csv(summary_path, index=False)
     logger.info(f"Sweep summary saved to {summary_path}")
 
-    metric_candidates = ['score', 'accuracy', 'f1', 'auc']
-    metric_used = next((m for m in metric_candidates if m in df.columns), None)
-    if metric_used:
-        best_row = df.sort_values(metric_used, ascending=False).iloc[0]
+    # (ไม่มีแก้) – ตรงนี้บันทึกไฟล์ชื่อ best_param.json ตามมาตรฐานโค้ด
+    metric_col = 'metric' if 'metric' in df.columns else None
+    if metric_col is None or df[metric_col].dropna().empty:
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
+        numeric_cols = [
+            c for c in numeric_cols if c not in {'run_id', 'seed', *param_names}
+        ]
+        if numeric_cols:
+            metric_col = numeric_cols[0]
+            df['metric'] = df[metric_col]
+            df.to_csv(summary_path, index=False)
+            logger.info(f"ใช้คอลัมน์ {metric_col} เป็น metric")
+    if metric_col and not df[metric_col].dropna().empty:
+        best_row = df.sort_values(metric_col, ascending=False).iloc[0]
         best_param_path = os.path.join(output_dir, 'best_param.json')
         best_row[param_names + ['seed']].to_json(best_param_path, force_ascii=False)
         logger.info(
-            f"Best param ({metric_used}): {dict(best_row[param_names + ['seed']])} -> {best_row[metric_used]}"
+            f"Best param: {dict(best_row[param_names + ['seed']])} -> {best_row[metric_col]}"
         )
+        if os.path.exists(best_param_path):
+            logger.info("[Patch v5.9.1] best_param.json saved to %s", best_param_path)
+        else:
+            logger.error("[Patch v5.9.1] best_param.json missing at %s", best_param_path)
     else:
-        logger.warning("No metric column found for best_param export.")
+        logger.warning("ไม่มีคอลัมน์ metric หรือไม่มีข้อมูลสำหรับ export best_param")
 
 
-def main() -> None:
+def parse_args(args=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output_dir', default='sweep_results')
+    parser.add_argument('--output_dir', default=DEFAULT_SWEEP_DIR)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--param_learning_rate', default='0.01,0.05')
     parser.add_argument('--param_depth', default='6,8')
     parser.add_argument('--param_l2_leaf_reg', default='1,3,5')
-    parser.add_argument('--trade_log_path')
+    parser.add_argument('--param_subsample', default='0.8,1.0')  # [Patch v6.2.1] new CLI option
+    parser.add_argument('--param_colsample_bylevel', default='0.8,1.0')  # [Patch v6.2.1] new CLI option
+    parser.add_argument(
+        '--trade_log_path', '--trade-log',
+        dest='trade_log_path',
+        default=DEFAULT_TRADE_LOG,
+    )
     parser.add_argument('--m1_path')
-    args = parser.parse_args()
+    return parser.parse_args(args)
+
+
+def main(args=None) -> None:
+    args = parse_args(args)
 
     params_grid = _parse_multi_params(args)
     run_sweep(

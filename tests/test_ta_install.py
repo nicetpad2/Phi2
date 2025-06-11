@@ -5,13 +5,16 @@ import os
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT_DIR)
-sys.path.insert(0, os.path.join(ROOT_DIR, 'src'))
+sys.path.insert(1, os.path.join(ROOT_DIR, 'src'))
 
 
 def test_ensure_ta_installed(monkeypatch):
-    dummy_ta = types.ModuleType('ta')
+    dummy_vendor = types.ModuleType('vendor')
+    dummy_ta = types.ModuleType('vendor.ta')
     dummy_ta.__version__ = '0.test'
-    monkeypatch.setitem(sys.modules, 'ta', dummy_ta)
+    dummy_vendor.ta = dummy_ta
+    monkeypatch.setitem(sys.modules, 'vendor', dummy_vendor)
+    monkeypatch.setitem(sys.modules, 'vendor.ta', dummy_ta)
     monkeypatch.setitem(sys.modules, 'seaborn', types.ModuleType('seaborn'))
     monkeypatch.setitem(sys.modules, 'requests', types.ModuleType('requests'))
     monkeypatch.setitem(sys.modules, 'shap', types.ModuleType('shap'))

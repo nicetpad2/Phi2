@@ -3,11 +3,11 @@ import os
 import pytest
 
 FUNCTIONS_INFO = [
-    ("src/config.py", "log_library_version", 88),
-    ("src/config.py", "_ensure_ta_installed", 133),
-    ("src/config.py", "is_colab", 362),
-    ("src/config.py", "print_gpu_utilization", 458),
-    ("src/config.py", "show_system_status", 510),
+    ("src/config.py", "log_library_version", 183),
+    ("src/config.py", "_ensure_ta_installed", 228),
+    ("src/config.py", "is_colab", 459),
+    ("src/config.py", "print_gpu_utilization", 557),
+    ("src/config.py", "show_system_status", 609),
 
 
     ("src/data_loader.py", "inspect_file_exists", 906),
@@ -16,18 +16,20 @@ FUNCTIONS_INFO = [
     ("src/data_loader.py", "check_duplicates", 925),
     ("src/data_loader.py", "check_price_jumps", 932),
     ("src/data_loader.py", "convert_thai_years", 940),
-    ("src/data_loader.py", "prepare_datetime_index", 947),
-    ("src/data_loader.py", "load_raw_data_m1", 976),
-    ("src/data_loader.py", "load_raw_data_m15", 987),
-    ("src/data_loader.py", "write_test_file", 992),
+    ("src/data_loader.py", "convert_thai_datetime", 949),
+    ("src/data_loader.py", "prepare_datetime_index", 977),
+    ("src/data_loader.py", "load_raw_data_m1", 1006),
+    ("src/data_loader.py", "load_raw_data_m15", 1017),
+    ("src/data_loader.py", "write_test_file", 1022),
+    ("src/data_loader.py", "validate_csv_data", 1030),
 
 
-    ("src/features.py", "calculate_trend_zone", 1337),
-    ("src/features.py", "tag_price_structure_patterns", 310),
-    ("src/features.py", "create_session_column", 1344),
-    ("src/features.py", "fill_missing_feature_values", 1350),
-    ("src/features.py", "load_feature_config", 1355),
-    ("src/features.py", "calculate_ml_features", 1360),
+    ("src/features.py", "calculate_trend_zone", 1529),
+    ("src/features.py", "tag_price_structure_patterns", 473),
+    ("src/features.py", "create_session_column", 1536),
+    ("src/features.py", "fill_missing_feature_values", 1542),
+    ("src/features.py", "load_feature_config", 1547),
+    ("src/features.py", "calculate_ml_features", 1552),
 
 
 
@@ -38,13 +40,13 @@ FUNCTIONS_INFO = [
 
 # [Patch v5.5.3] Updated expected line numbers
 
-    ("src/main.py", "parse_arguments", 1876),
-    ("src/main.py", "setup_output_directory", 1881),
-    ("src/main.py", "load_features_from_file", 1886),
-    ("src/main.py", "drop_nan_rows", 1891),
-    ("src/main.py", "convert_to_float32", 1896),
-    ("src/main.py", "run_initial_backtest", 1901),
-    ("src/main.py", "save_final_data", 1906),
+    ("src/main.py", "parse_arguments", 1890),
+    ("src/main.py", "setup_output_directory", 1895),
+    ("src/main.py", "load_features_from_file", 1900),
+    ("src/main.py", "drop_nan_rows", 1905),
+    ("src/main.py", "convert_to_float32", 1910),
+    ("src/main.py", "run_initial_backtest", 1915),
+    ("src/main.py", "save_final_data", 1920),
 
 
 
@@ -52,33 +54,40 @@ FUNCTIONS_INFO = [
 
 
 
-    ("src/main.py", "parse_arguments", 1876),
-    ("src/main.py", "setup_output_directory", 1881),
-    ("src/main.py", "load_features_from_file", 1886),
-    ("src/main.py", "drop_nan_rows", 1891),
-    ("src/main.py", "convert_to_float32", 1896),
-    ("src/main.py", "run_initial_backtest", 1901),
-    ("src/main.py", "save_final_data", 1906),
-
-
-
-
-
-    ("src/strategy.py", "run_backtest_simulation_v34", 1851),
-    ("src/strategy.py", "initialize_time_series_split", 4330),
-    ("src/strategy.py", "calculate_forced_entry_logic", 4333),
-    ("src/strategy.py", "apply_kill_switch", 4336),
-    ("src/strategy.py", "log_trade", 4339),
-    ("src/strategy.py", "calculate_metrics", 3068),
-    ("src/strategy.py", "aggregate_fold_results", 4342),
+    ("src/main.py", "parse_arguments", 1890),
+    ("src/main.py", "setup_output_directory", 1895),
+    ("src/main.py", "load_features_from_file", 1900),
+    ("src/main.py", "drop_nan_rows", 1905),
+    ("src/main.py", "convert_to_float32", 1910),
+    ("src/main.py", "run_initial_backtest", 1915),
+    ("src/main.py", "save_final_data", 1920),
 
 
 
 
 
 
+    ("src/strategy.py", "run_backtest_simulation_v34", 1948),
 
-    ("ProjectP.py", "custom_helper_function", 36),
+    ("src/strategy.py", "initialize_time_series_split", 4621),
+    ("src/strategy.py", "calculate_forced_entry_logic", 4624),
+    ("src/strategy.py", "apply_kill_switch", 4627),
+    ("src/strategy.py", "log_trade", 4630),
+
+    ("src/strategy.py", "calculate_metrics", 3249),
+
+    ("src/strategy.py", "aggregate_fold_results", 4633),
+
+
+    ("src/strategy.py", "aggregate_fold_results", 4633),
+
+
+
+
+
+
+
+    ("ProjectP.py", "custom_helper_function", 51),
 ]
 
 

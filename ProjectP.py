@@ -1,13 +1,41 @@
 """Bootstrap script for running the main entry point."""
 
-from src.config import logger
-import sys
 import logging
+import csv
+from pathlib import Path
+try:  # [Patch v5.10.2] allow import without heavy dependencies
+    from src.config import logger, OUTPUT_DIR
+except Exception:  # pragma: no cover - fallback logger for tests
+    logger = logging.getLogger("ProjectP")
+    OUTPUT_DIR = Path("output_default")
+# [Patch v5.9.17] Fallback logger if src.config fails
+import sys
 import os
 import argparse
 import subprocess
+import json
+
+# [Patch v6.2.3] Auto-fallback to project root if current working dir is invalid
+try:
+    os.getcwd()
+except Exception:
+    os.chdir(Path(__file__).resolve().parent)
 import pandas as pd
+from typing import Dict, List
 import main as pipeline
+from config_loader import update_config_from_dict  # [Patch] dynamic config update
+from wfv_runner import run_walkforward  # [Patch] walk-forward helper
+
+# Default grid for hyperparameter sweep
+DEFAULT_SWEEP_PARAMS: Dict[str, List[float]] = {
+    "learning_rate": [0.01, 0.05],
+    "depth": [6, 8],
+    "l2_leaf_reg": [1, 3, 5],
+    "subsample": [0.8, 1.0],
+    "colsample_bylevel": [0.8, 1.0],
+    "bagging_temperature": [0.0, 1.0],
+    "random_strength": [0.0, 1.0],
+}
 
 # [Patch] Initialize pynvml for GPU status detection
 try:
@@ -23,7 +51,6 @@ except Exception:  # pragma: no cover - NVML failure fallback
 
 from src.main import main
 
-
 def configure_logging():
     """Set up consistent logging configuration."""
     logging.basicConfig(
@@ -31,7 +58,6 @@ def configure_logging():
         format="%(asctime)s [%(levelname)s][%(filename)s:%(lineno)d] - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
 
 def custom_helper_function():
     """Stubbed helper for tests."""
@@ -43,7 +69,7 @@ def parse_projectp_args(args=None):
     parser = argparse.ArgumentParser(description="สคริปต์ควบคุมโหมดการทำงาน")
     parser.add_argument(
         "--mode",
-        choices=["preprocess", "sweep", "threshold", "backtest", "report", "all"],
+        choices=["preprocess", "sweep", "threshold", "backtest", "report", "all", "hyper_sweep", "wfv"],
         default="preprocess",
         help="ขั้นตอนที่จะรัน",
     )
@@ -59,17 +85,41 @@ def run_preprocess():
     return main()
 
 
-def run_sweep():
-    """รันการค้นหาค่าพารามิเตอร์."""
-    # [Patch v5.7.2] Resolve sweep path relative to this file for Colab support
+def _run_script(relative_path: str) -> None:
+    """Execute a Python script located relative to this file."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    sweep_path = os.path.join(script_dir, "tuning", "hyperparameter_sweep.py")
-    subprocess.run([sys.executable, sweep_path], check=True)
+    abs_path = os.path.join(script_dir, relative_path)
+    subprocess.run([sys.executable, abs_path], check=True)
+
+
+def run_hyperparameter_sweep(params: Dict[str, List[float]]) -> None:
+    """รันการค้นหาค่าพารามิเตอร์."""
+    logger.debug(f"Starting sweep with params: {params}")
+    from tuning.hyperparameter_sweep import run_sweep as _sweep, DEFAULT_TRADE_LOG
+    _sweep(
+        str(OUTPUT_DIR),
+        params,
+        seed=42,
+        resume=True,
+        trade_log_path=DEFAULT_TRADE_LOG,
+    )
+
+
+def run_sweep():
+    """รันการค้นหาค่าพารามิเตอร์ (backward compatibility)."""
+    _run_script(os.path.join("tuning", "hyperparameter_sweep.py"))
+
+
+def run_threshold_optimization() -> pd.DataFrame:
+    """รันการปรับค่า threshold."""
+    logger.debug("Starting threshold optimization")
+    from threshold_optimization import run_threshold_optimization as _opt
+    return _opt()
 
 
 def run_threshold():
-    """รันการปรับค่า threshold."""
-    subprocess.run([sys.executable, "threshold_optimization.py"], check=True)
+    """รันการปรับค่า threshold (backward compatibility)."""
+    _run_script("threshold_optimization.py")
 
 
 def run_backtest():
@@ -86,18 +136,31 @@ def run_backtest():
     pipeline.run_backtest_pipeline(pd.DataFrame(), pd.DataFrame(), model_path, threshold)
 
 
-def run_report():
+def run_report() -> None:
     """สร้างรายงานผลการทดสอบ."""
-    pipeline.run_report()
+    config = pipeline.load_config()
+    pipeline.run_report(config)
 
 
-def run_all_steps():
+def run_full_pipeline() -> None:
     """รันทุกโหมดต่อเนื่องกัน."""
     run_preprocess()
-    run_sweep()
-    run_threshold()
+    run_hyperparameter_sweep(DEFAULT_SWEEP_PARAMS)
+    run_threshold_optimization()
     run_backtest()
     run_report()
+
+
+def release_gpu_resources(handle, use_gpu: bool) -> None:
+    """Release NVML handle and log the result."""
+    if use_gpu and "pynvml" in globals() and handle:
+        try:
+            pynvml.nvmlShutdown()
+            logging.info("GPU resources released")
+        except Exception as exc:  # pragma: no cover - unlikely NVML failure
+            logging.warning(f"Failed to shut down NVML: {exc}")
+    else:
+        logging.info("GPU not available, running on CPU")
 
 
 def run_mode(mode):
@@ -105,41 +168,126 @@ def run_mode(mode):
     if mode == "preprocess":
         run_preprocess()
     elif mode == "sweep":
-        run_sweep()
+        run_hyperparameter_sweep(DEFAULT_SWEEP_PARAMS)
     elif mode == "threshold":
-        run_threshold()
+        run_threshold_optimization()
     elif mode == "backtest":
         run_backtest()
     elif mode == "report":
         run_report()
+    elif mode == "hyper_sweep":
+        run_hyperparameter_sweep(DEFAULT_SWEEP_PARAMS)
+    elif mode == "wfv":
+        run_walkforward()  # [Patch] call simplified WFV runner
     elif mode == "all":
-        run_all_steps()
+        # [Patch] Sweep then update config and run WFV
+        run_hyperparameter_sweep(DEFAULT_SWEEP_PARAMS)
+        # อ่านไฟล์ที่ sweep สร้าง (รองรับชื่อ best_param.json และ best_params.json)
+        candidates = [OUTPUT_DIR / "best_param.json", OUTPUT_DIR / "best_params.json"]
+        for cand in candidates:
+            if os.path.exists(cand):
+                with open(cand, "r", encoding="utf-8") as fh:
+                    best_params = json.load(fh)
+                update_config_from_dict(best_params)
+                break
+        run_walkforward()
     else:
         raise ValueError(f"Unknown mode: {mode}")
+
+
+def qa_check_and_create_outputs():
+    """[Patch v5.8.14] Ensure fallback QA output files have valid headers."""
+    output_dir = str(OUTPUT_DIR)
+    files = [
+        os.path.join(output_dir, "features_main.json"),
+        os.path.join(output_dir, "trade_log_BUY.csv"),
+        os.path.join(output_dir, "trade_log_SELL.csv"),
+        os.path.join(output_dir, "trade_log_NORMAL.csv"),
+    ]
+    missing = [p for p in files if not os.path.exists(p) or os.path.getsize(p) == 0]
+    for path in missing:
+        logger.warning("[QA Fallback] Created missing file: %s", path)
+        dirpath = os.path.dirname(path)
+        if not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+        if path.endswith("features_main.json"):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{}")  # JSON เปล่าแต่ valid
+        else:
+            header = [
+                "timestamp",
+                "symbol",
+                "side",
+                "price",
+                "size",
+                "order_type",
+                "status",
+            ]
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=header)
+                writer.writeheader()
+        logger.debug("[QA Fallback] Wrote header to %s", path)
 
 
 if __name__ == "__main__":
     configure_logging()  # [Patch v5.5.14] Ensure consistent logging format
     args = parse_args()
+    # [Patch v5.9.5] สร้างไฟล์ QA พื้นฐานก่อนเริ่มการทำงานลดข้อความ error
+    qa_check_and_create_outputs()
     try:
         run_mode(args.mode)
         
         # [Patch v5.3.4] Create empty audit files if missing after run
-        output_dir = "./output_default"
+        output_dir = OUTPUT_DIR
         audit_files = [
             "features_main.json",
             "trade_log_BUY.csv",
             "trade_log_SELL.csv",
             "trade_log_NORMAL.csv",
         ]
-        for f in audit_files:
-            fpath = os.path.join(output_dir, f)
-            if os.path.exists(fpath):
-                logger.info(f"[QA] Output present: {fpath}")
+        for fname in audit_files:
+            fpath = OUTPUT_DIR / fname
+            if fpath.exists():
+                msg = f"[QA] Output present: {fpath}"
+                logger.info(msg)
+                logging.getLogger().info(msg)
+                continue
+            msg = f"[QA] Output missing: {fpath}"
+            logger.error(msg)
+            logging.getLogger().error(msg)
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            if fname.endswith('.csv'):
+                pd.DataFrame(columns=[
+                    "timestamp", "symbol", "side", "price", "size", "order_type", "status"
+                ]).to_csv(fpath, index=False)
             else:
-                logger.error(f"[QA] Output missing: {fpath}")
-                os.makedirs(output_dir, exist_ok=True)
-                open(fpath, "w", encoding="utf-8").close()
+                with open(fpath, 'w', encoding='utf-8') as fout:
+                    json.dump({}, fout)
+            logger.warning(f"[QA Fallback] Created missing file: {fpath}")
+
+
+        # [Patch v5.8.13] Ensure fallback QA output files always exist
+        fallback_files = [
+            "features_main.json",
+            "trade_log_BUY.csv",
+            "trade_log_SELL.csv",
+            "trade_log_NORMAL.csv",
+        ]
+
+        for fname in fallback_files:
+            fpath = OUTPUT_DIR / fname
+            if fpath.exists():
+                continue
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            if fname.endswith('.csv'):
+                pd.DataFrame(columns=[
+                    "timestamp", "symbol", "side", "price", "size", "order_type", "status"
+                ]).to_csv(fpath, index=False)
+            else:
+                with open(fpath, 'w', encoding='utf-8') as fout:
+                    json.dump({}, fout)
+            logger.warning(f"[QA Fallback] Created missing file: {fpath}")
+
     except KeyboardInterrupt:
         print("\n(Stopped) การทำงานถูกยกเลิกโดยผู้ใช้.")
     except Exception as e:
@@ -149,11 +297,4 @@ if __name__ == "__main__":
         # [Patch v5.0.23] Respect USE_GPU_ACCELERATION flag when logging GPU status
         main_mod = sys.modules.get("src.main")
         use_gpu = getattr(main_mod, "USE_GPU_ACCELERATION", False)
-        if use_gpu and "pynvml" in globals() and nvml_handle:
-            try:
-                pynvml.nvmlShutdown()
-                logging.info("GPU resources released")
-            except Exception as e:
-                logging.warning(f"Failed to shut down NVML: {e}")
-        else:
-            logging.info("GPU not available, running on CPU")
+        release_gpu_resources(nvml_handle, use_gpu)

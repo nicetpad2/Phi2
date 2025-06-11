@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # <<< เพิ่ม Encoding declaration สำหรับอักษรไทย (ควรอยู่บรรทัดแรกสุด) >>>
+"""Utility helpers for loading CSV files and preparing dataframes."""
 
 # ==============================================================================
 # === START OF PART 3/12 ===
@@ -38,6 +39,8 @@ try:
     import requests
 except ImportError:  # pragma: no cover - optional dependency for certain features
     requests = None
+
+logger = logging.getLogger(__name__)
 import datetime # <<< ENSURED Standard import 'import datetime'
 
 # --- JSON Serialization Helper (moved earlier for global availability) ---
@@ -400,10 +403,12 @@ def safe_set_datetime(df, idx, col, val, naive_tz=None):
             if idx in df.index:
                 if col not in df.columns or df[col].dtype != 'datetime64[ns]':
                     # Ensure column exists with a datetime-compatible dtype if creating/fixing it during fallback
-                    df[col] = pd.Series(dtype='datetime64[ns]', index=df.index)
+                    df[col] = pd.Series(dtype='datetime64[ns]', index=df.index)  # pragma: no cover
                 df.loc[idx, col] = pd.NaT
             else:
-                logging.warning(f"   safe_set_datetime: Index '{idx}' not found during fallback NaT assignment for column '{col}'.")
+                logging.warning(
+                    f"   safe_set_datetime: Index '{idx}' not found during fallback NaT assignment for column '{col}'."
+                )  # pragma: no cover
         except Exception as e_fallback:
             logging.error(f"   (Error) safe_set_datetime: Failed to assign NaT as fallback for '{col}' at index {idx}: {e_fallback}")
 # <<< End of [Patch] MODIFIED v4.8.8 (Patch 26.11) >>>
@@ -943,6 +948,34 @@ def convert_thai_years(df, column):
         df[column] = pd.to_datetime(df[column], errors='coerce')
     return df
 
+# [Patch v5.7.3] Convert Thai Buddhist year datetime string to pandas Timestamp
+def convert_thai_datetime(series, tz="UTC", errors="raise"):
+    """Convert Thai date strings to timezone-aware ``datetime``.
+
+    Years greater than 2500 are assumed to be Buddhist Era and are
+    converted to Gregorian by subtracting 543. Invalid values raise
+    ``ValueError`` when ``errors='raise'`` otherwise return ``NaT``.
+    """
+    is_series = isinstance(series, pd.Series)
+    if not is_series and not isinstance(series, str):
+        raise TypeError("series must be a pandas Series or str")
+
+    def _parse(value):
+        try:
+            dt = datetime.datetime.fromisoformat(str(value))
+        except Exception:
+            if errors == "raise":
+                raise ValueError(f"Cannot parse datetime: {value}")
+            return pd.NaT
+        if dt.year > 2500:
+            dt = dt.replace(year=dt.year - 543)
+        ts = pd.Timestamp(dt)
+        return ts.tz_localize(tz) if ts.tzinfo is None else ts.tz_convert(tz)
+
+    if is_series:
+        return series.apply(_parse)
+    return _parse(series)
+
 
 def prepare_datetime_index(df):
     """Stubbed datetime index preparer."""
@@ -996,6 +1029,31 @@ def write_test_file(path):
     return path
 
 
+# [Patch v5.7.3] Validate DataFrame for required columns and non-emptiness
+def validate_csv_data(df, required_cols=None):
+    """Ensure ``df`` is non-empty and contains required columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Loaded DataFrame to validate.
+    required_cols : list of str, optional
+        Columns that must be present. If ``None`` no check is performed.
+
+    Returns
+    -------
+    pd.DataFrame
+        The validated DataFrame.
+    """
+    if df is None or df.empty:
+        raise ValueError("CSV data is empty")
+    if required_cols:
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise KeyError(f"Missing columns: {missing}")
+    return df
+
+
 # [Patch v5.4.5] Robust loader for final M1 data
 def load_final_m1_data(path, trade_log_df=None):
     """Load prepared M1 dataset with validation and timezone alignment."""
@@ -1042,9 +1100,10 @@ def check_data_quality(df, dropna=True, fillna_method=None, subset_dupes=None):
 
     if fillna_method:
         # [Patch v5.6.2] Replace deprecated fillna(method=...) usage
-        if fillna_method.lower() == "ffill":
+        method = fillna_method.lower()
+        if method in ("ffill", "pad"):
             df.ffill(inplace=True)
-        elif fillna_method.lower() == "bfill":
+        elif method in ("bfill", "backfill"):
             df.bfill(inplace=True)
         else:
             df.fillna(method=fillna_method, inplace=True)
@@ -1060,4 +1119,37 @@ def check_data_quality(df, dropna=True, fillna_method=None, subset_dupes=None):
             df.drop_duplicates(subset=subset_dupes, keep="first", inplace=True)
 
     return df
+
+
+__all__ = [
+    "safe_get_global",
+    "setup_output_directory",
+    "set_thai_font",
+    "install_thai_fonts_colab",
+    "configure_matplotlib_fonts",
+    "setup_fonts",
+    "safe_load_csv_auto",
+    "load_app_config",
+    "safe_set_datetime",
+    "load_data",
+    "load_data_cached",
+    "preview_datetime_format",
+    "parse_datetime_safely",
+    "prepare_datetime",
+    "inspect_file_exists",
+    "read_csv_with_date_parse",
+    "check_nan_percent",
+    "check_duplicates",
+    "check_price_jumps",
+    "convert_thai_years",
+    "convert_thai_datetime",
+    "prepare_datetime_index",
+    "validate_m1_data_path",
+    "load_raw_data_m1",
+    "load_raw_data_m15",
+    "write_test_file",
+    "validate_csv_data",
+    "load_final_m1_data",
+    "check_data_quality",
+]
 

@@ -1,102 +1,499 @@
-### 2025-10-07
-- [Patch v5.7.2] Fix sweep path to absolute for Colab execution
-- New/Updated unit tests added for tests.test_projectp_cli
-- QA: pytest -q passed (370 tests)
+### 2025-06-15
+- [Patch v6.2.3] Handle getcwd and MKL errors
+- New/Updated unit tests added for tests/test_projectp_getcwd.py, tests/test_config_mkl_error.py
+- QA: pytest -q passed (2 tests)
 
-### 2025-10-08
-
-- [Patch v5.7.3] Log reasons when folds have no trades
-- New/Updated unit tests added for tests.test_empty_summary
-
+### 2025-06-14
+- [Patch v6.2.2] เพิ่ม monitor_auc_drop เพื่อตรวจจับ AUC ต่ำกว่าค่ากำหนด
+- New/Updated unit tests added for tests/test_wfv_monitor.py
 - QA: pytest -q passed
 
-### 2025-10-06
-
-- [Patch v5.6.8] Handle empty trade logs and lower default ML threshold
-- New/Updated unit tests added for tests.test_empty_summary and tests.test_function_registry
-- QA: pytest -q passed (364 tests)
-
-### 2025-10-06
-- [Patch v5.7.1] Lower default signal score threshold and enable meta filter toggle
-- New/Updated unit tests added for tests.test_config_defaults
-- QA: pytest -q passed (363 tests)
-
-### 2025-10-06
-- [Patch v5.6.8] Add needs_retrain method and retrain warning logic
-- New/Updated unit tests added for tests.test_drift_retrain_logic
-- QA: pytest -q failed (6 failed)
-
-
-### 2025-10-05
-- [Patch v5.6.7] Add config toggle for soft cooldown and relax thresholds
-- New/Updated unit tests added for tests.test_config_defaults
-- QA: pytest -q passed (363 tests)
-
-### 2025-09-02
-
-- [Patch v5.6.5] Relax soft cooldown conditions and shorten cooldown duration
-- New/Updated unit tests added for cooldown_utils and strategy
-- QA: pytest -q passed (351 tests)
-
-
-### 2025-09-03
-- [Patch v5.6.6] Update soft cooldown logic with side filter
-- New/Updated unit tests added for tests.test_soft_cooldown_logic
+### 2025-06-09
+- [Patch v6.2.1] Resolve relative data_path in wfv_runner
+- New/Updated unit tests added for tests/test_wfv_runner.py
 - QA: pytest -q passed
 
-### 2025-09-04
-- [Patch v5.6.7] เพิ่มพารามิเตอร์ trade_log_path และ m1_path ให้ hyperparameter_sweep
-- New/Updated unit tests added for none (existing coverage)
-- QA: pytest -q passed (363 tests)
+### 2025-06-09
+- [Patch v6.2.0] เพิ่มรายงาน drift รายวัน/สัปดาห์ และกราฟ trade log
+- New/Updated unit tests added for tests/test_evaluation_drift_summary.py, tests/test_log_analysis_report.py, tests/test_projectp_sweep_defaults.py
+- QA: pytest -q passed
 
-### 2025-09-01
-- [Patch v5.6.4] Fix boundary logic for session tagging and reduce duplicate warnings
+
+### 2025-06-14
+- [Patch v6.2.1] สร้าง DATA_DIR และกำหนด SYMBOL/TIMEFRAME พร้อมค่า hyperparameter เริ่มต้น
+- New/Updated unit tests added for tests/test_config_defaults.py, tests/test_config_data_dir.py
+- QA: pytest -q passed (874 tests)
+
+
+### 2025-06-13
+- [Patch v6.1.8] เพิ่มฟังก์ชัน monitor_drift และ plot_expectancy_by_period
+- New/Updated unit tests added for tests/test_wfv_monitor.py, tests/test_log_analysis_extra.py, tests/test_projectp_sweep_defaults.py
+- QA: pytest -q passed (870 tests)
+
+### 2025-06-13
+- [Patch v5.10.9] รองรับ resume เมื่อ summary.csv ขาดคอลัมน์ใน hyperparameter_sweep
+- New/Updated unit tests added for tests/test_hyperparameter_sweep_cli.py
+- QA: pytest -q passed (871 tests)
+
+### 2025-06-12
+
+- [Patch v6.1.7] เพิ่ม LSTM, ฟีเจอร์ Engulfing และตรวจจับ Drift รายช่วงเวลา
+- New/Updated unit tests added for tests/test_training_lstm.py, tests/test_features_engulfing.py, tests/test_drift_calc.py, tests/test_log_summary.py
+- QA: pytest -q passed (867 tests)
+
+
+### 2025-06-10
+- [Patch v6.1.5] ปรับ run_walkforward ให้อ่านข้อมูลจริงจาก CSV
+- New/Updated unit tests added for tests/test_wfv_runner.py
+- QA: pytest -q passed
+
+### 2025-06-11
+- [Patch v6.1.6] เพิ่มเครื่องมือวิเคราะห์ equity curve และทดสอบ WFV เพิ่มเติม
+- New/Updated unit tests added for tests/test_log_analysis_equity.py, tests/test_wfv_runner.py
+- QA: pytest -q passed (863 tests)
+
+### 2025-06-09
+- [Patch v6.1.4] เพิ่ม walk_forward_loop และบันทึกผลเป็น CSV
+- New/Updated unit tests added for tests/test_wfv_monitor.py, tests/test_wfv_runner.py
+- QA: pytest -q passed (859 tests)
+- [Patch v6.1.3] Implement sample walk-forward execution in wfv_runner
+- New/Updated unit tests added for tests/test_wfv_runner.py
+- QA: pytest -q passed
+- [Patch v5.9.5] เรียก qa_check_and_create_outputs ก่อนเริ่ม run_mode เพื่อลด error log ที่ไม่จำเป็น
+- New/Updated unit tests added for none (script patch)
+- QA: pytest -q passed
+-
+- [Patch v5.9.4] Increase TP multiplier to 3x ATR
+- New/Updated unit tests added for tests/unit/test_strategy_additional_coverage.py
+- QA: pytest -q passed (856 tests)
+
+### 2025-06-08
+- [Patch v5.9.3] Add default CatBoost hyperparameters to src.config
+- New/Updated unit tests added for tests/test_config_defaults.py
+- QA: pytest -q passed
+
+### 2025-06-07
+- [Patch v5.9.2] Support both best_param.json and best_params.json in CLI
+- New/Updated unit tests added for tests/test_projectp_cli.py
+- QA: pytest -q passed (856 tests)
+
+### 2025-06-07
+- [Patch v5.9.1] Unify OUTPUT_DIR constant and parallelize hyperparameter sweep
+- New/Updated unit tests added for tests/test_training_hyper_sweep.py
+- QA: pytest -q passed (854 tests)
+
+### 2025-06-07
+- [Patch v5.9.1] Direct sweep output to unified OUTPUT_DIR and confirm best_param.json location
+- New/Updated unit tests added for tests/test_hyperparameter_sweep_cli.py
+- QA: pytest -q passed (855 tests)
+
+### 2025-06-07
+
+- [Patch v5.9.1] Use OUTPUT_DIR constant for hyper-sweep and QA fallback
+- New/Updated unit tests added for tests/test_projectp_fallback.py
+- QA: pytest -q passed (854 tests)
+
+### 2025-06-07
+
+
+- [Patch v5.8.14] Improve single-row hyperparameter sweep fallback
+- New/Updated unit tests added for tests/test_training_hyper_sweep.py
+- QA: pytest -q passed (842 tests)
+
+
+### 2025-06-07
+- [Patch v5.8.13] เพิ่ม unit tests สำหรับ main.py ให้ครอบคลุมมากขึ้น
+- New/Updated unit tests added for tests/test_main_cli_extended.py
+- QA: pytest -q passed (819 tests)
+### 2025-06-07
+- [Patch v5.10.8] Add coverage for config module
+- New/Updated unit tests added for tests/test_config_extended.py
+- QA: pytest -q passed (792 tests)
+
+### 2025-06-07
+- [Patch v5.8.13] Ultra-Robust Hyperparameter Sweep with fallback score and strict train size
+- New/Updated unit tests added for tests/test_training_more.py
+- QA: pytest -q passed (801 tests)
+
+
+### 2025-06-07
+- [Patch v5.10.7] Replace deprecated fillna method
+- New/Updated unit tests added for tests/unit/test_data_loader_full.py
+- QA: pytest -q passed (779 tests)
+
+### 2025-06-07
+- [Patch v5.10.8] Improve placeholder trade log generation
+- New/Updated unit tests added for tests/test_hyperparameter_sweep_cli.py
+- QA: pytest -q passed (788 tests)
+
+### 2025-06-06
+- [Patch v5.10.4] Increase coverage for data loader
+- New/Updated unit tests added for tests/unit/test_data_loader_full.py
+- QA: pytest -q passed (767 tests)
+
+### 2025-06-23
+- [Patch v5.10.3] Ensure config defaults imported under pytest
+- New/Updated unit tests added for tests/test_config_defaults.py
+- QA: pytest -q tests/test_config_defaults.py passed (1 test)
+
+### 2025-06-07
+- [Patch v6.0.2] Cover empty log path in event_etl
+- New/Updated unit tests added for tests/test_event_etl.py
+- QA: pytest -q tests/test_event_etl.py passed (2 tests)
+
+### 2025-06-06
+
+- [Patch v5.10.2] Clarify lazy imports in profile_backtest
+- New/Updated unit tests added for none (doc comment)
+- QA: pytest -q failed (ImportError in tests)
+
+
+### 2025-06-06
+- [Patch v5.10.1] Refactor imports for pytest handling in profile_backtest
+- New/Updated unit tests added for tests.test_profile_backtest
+- QA: pytest -q passed (703 tests)
+### 2025-06-06
+- [Patch v5.9.16] Fix tests import path
+- New/Updated unit tests added for none (import fix)
+- QA: pytest tests/test_order_manager_more.py -q passed (7 tests)
+### 2025-06-06
+- [Patch v5.9.15] Add wfv unit tests
+- New/Updated unit tests added for tests.test_wfv_full
+- QA: pytest -q passed (11 tests)
+- [Patch v5.9.13] Improve coverage to 70%
+- New/Updated unit tests added for tests.test_signal_classifier_additional
+- QA: pytest -q passed (698 tests)
+
+### 2025-06-06
+- [Patch v5.9.15] Achieve full coverage for sessions module
 - New/Updated unit tests added for tests.test_sessions_utils
-- QA: pytest -q passed
+- QA: pytest -q passed (698 tests)
 
-### 2025-06-04
-- [Patch v5.6.5] Add volatility filter to entry logic
-- New/Updated unit tests added for tests.test_namedtuple_row and tests.test_volatility_filter
-- QA: pytest -q passed
+### 2025-06-10
+- [Patch v5.9.12] Increase coverage of training module
+- New/Updated unit tests added for tests.test_training_extended
+- QA: pytest -q passed (25 tests)
 
-### 2025-08-31
+### 2025-06-06
+- [Patch v5.9.13] Remove xfail markers for stable tests
+- New/Updated unit tests added for none (test markers updated)
+- QA: pytest -q passed (696 tests)
 
-- [Patch v5.6.4] Extend Asia session to 22-8 and update tests
-- QA: pytest -q passed
+### 2025-06-09
+- [Patch v5.9.11] Increase coverage of trend_filter
+- New/Updated unit tests added for tests.test_trend_filter
+- QA: pytest -q reported failures (5 failed, 641 passed)
 
-
-#
-### 2025-08-30
-- [Patch v5.6.3] Reduce log spam for out-of-session timestamps
-- QA: pytest -q passed (347 tests)
-### 2025-08-29
-- [Patch v5.6.2] Remove PyTables dependency for feature persistence
-- Fix FutureWarning in check_data_quality
-- New/Updated unit tests added for tests.test_features_hdf5
-- QA: pytest -q passed (347 tests)
-### 2025-08-28
-- [Patch v5.6.1] Improve model utilities
-- New/Updated unit tests added for tests.test_model_utils_new
-- QA: pytest -q passed (325 tests)
-
-### 2025-08-28
-
-- [Patch v5.6.1] Add dataclass-based order logging with rotating file support
+### 2025-06-06
+- [Patch v5.9.9] Increase coverage of trade_logger to 100%
 - New/Updated unit tests added for tests.test_trade_logger
-- QA: pytest -q passed (325 tests)
+- QA: pytest -q passed (600 tests)
 
 
-### 2025-08-26
-- [Patch v5.6.0] Refactor font setup and CSV loader
-- New/Updated unit tests added for data_loader
-- QA: pytest -q passed (325 tests)
+### 2025-06-06
+- [Patch v5.9.9] ปรับปรุง update_config_from_dict
+- New/Updated unit tests added for tests.test_config_loader
+- QA: pytest -q passed (13 tests)
+
+### 2025-06-06
+
+- [Patch v5.9.8] Add hyper_sweep and WFV modes
+- New/Updated unit tests added for tests.test_projectp_cli, tests.test_config_loader, tests.test_wfv_runner
+- QA: pytest -q passed (584 tests)
 
 
-### 2025-08-27
-- [Patch v5.6.1] Refactor cooldown state management
-- New/Updated unit tests added for cooldown_utils
+### 2025-06-06
+- [Patch v5.9.7] Expand coverage to all src modules
+- New/Updated unit tests added for none (configuration change)
+- QA: pytest --cov=src passed (580 tests)
 
-- QA: pytest -q passed (333 tests)
+### 2025-06-06
+- [Patch vX.Y.Z] เปิดใช้งาน OMS_DEFAULT=True และเพิ่ม PAPER_MODE Flag สำหรับ Paper Trading
+- New/Updated unit tests added for tests.test_config_defaults, tests.test_function_registry
+- QA: pytest -q passed (569 tests)
+
+### 2025-06-06
+- [Patch v5.9.4] Improve OMS logging and add PAPER_MODE
+- New/Updated unit tests added for tests.test_config_defaults
+- QA: pytest -q passed (558 tests)
+
+### 2025-10-23
+- [Patch v5.9.2] Increase unit test coverage for cooldown utilities
+- New/Updated unit tests added for tests.test_cooldown_utils_full
+- QA: pytest -q passed (506 tests)
+
+### 2025-06-06
+
+- [Patch v5.9.4] Improve hyperparameter sweep with real trade log and metric export
+- New/Updated unit tests added for tests.test_hyperparameter_sweep_cli
+- QA: pytest -q passed (tests count TBD)
+
+
+### 2025-06-06
+- [Patch v5.9.2] Add unit tests for dashboard and evaluation
+- New/Updated unit tests added for tests.test_dashboard_extra2, tests.test_evaluation_extra
+- QA: pytest -q passed (517 tests)
+
+### 2025-06-06
+- [Patch v5.9.3] เพิ่มเทส param_stability และ qa_tools ครบถ้วน
+- New/Updated unit tests added for tests.test_param_stability, tests.test_qa_tools
+- QA: pytest -q passed (521 tests)
+
+### 2025-06-06
+- [Patch v5.9.2] Log duplicate removal count in calculate_m15_trend_zone
+- New/Updated unit tests added for tests.test_features_more::test_calculate_m15_trend_zone_duplicate_index
+- QA: pytest -q passed (526 tests)
+
+### 2025-06-06
+- [Patch v5.9.2] Add unit tests for order_manager
+- New/Updated unit tests added for tests.test_order_manager_module
+- QA: pytest -q passed (509 tests)
+
+### 2025-06-06
+- [Patch v5.9.1] Validate trade log not empty in real_train_func
+- New/Updated unit tests added for tests.test_training_empty_log::test_real_train_func_empty_trade_log
+- QA: pytest -q passed (505 tests)
+
+### 2025-10-22
+- [Patch v5.8.10] Add ADXIndicator fallback in vendor.ta.trend
+- New/Updated unit tests added for none (library patch)
+- QA: pytest -q passed (503 tests)
+
+### 2025-06-06
+- [Patch v5.9.0] Accept numpy float in update_drawdown
+- New/Updated unit tests added for tests.test_cooldown_state::test_update_drawdown_numpy_float
+- QA: pytest -q passed (504 tests)
+
+### 2025-06-06
+- [Patch v5.8.9] Fix logging capture and plotting APIs
+- New/Updated unit tests added for none (test fixes)
+- QA: pytest -q passed (503 tests)
+
+### 2025-10-21
+
+- [Patch v5.8.8] Add WFV overfitting utilities
+- New/Updated unit tests added for tests.test_wfv_overfit
+- QA: pytest -q passed (tests count TBD)
+
+
+
+### 2025-10-20
+- [Patch v5.8.7] Add risk management helpers
+- New/Updated unit tests added for tests.test_strategy_new_modules
+- QA: pytest -q passed (466 tests)
+
+### 2025-10-19
+- [Patch v5.8.6] Add CI workflow and update badges
+- New/Updated unit tests added for none (CI configuration)
+- QA: pytest -q passed (existing tests)
+
+
+
+### 2025-10-18
+- [Patch v5.8.5] Add strategy submodules and documentation
+- New/Updated unit tests added for tests.test_strategy_modules
+- QA: pytest -q passed (433 tests)
+
+### 2025-10-19
+- [Patch v5.8.6] Thread-safe order & risk managers with config settings
+- New/Updated unit tests added for tests.test_order_manager_extended, tests.test_strategy_modules
+- QA: pytest -q passed (460 tests)
+
+### 2025-10-17
+
+
+- [Patch v5.8.4] Update setup.py packaging metadata
+- New/Updated unit tests added for none (packaging update)
+- QA: pytest -q passed (429 tests)
+
+### 2025-06-08
+- [Patch v5.8.3] Add data leakage prevention utilities
+- New/Updated unit tests added for tests.test_leakage
+- QA: pytest -q passed (failed in CI)
+
+### 2025-06-06
+- [Patch v5.8.5] Add core strategy modules under strategy/
+- New/Updated unit tests added for tests/test_strategy_new_modules.py and tests/test_imports.py
+- QA: pytest -q passed (438 tests)
+
+
+### 2025-10-16
+
+- [Patch v5.8.3] Add folder-specific READMEs under docs
+- New/Updated unit tests added for none (documentation update)
+- QA: pytest -q passed (existing tests)
+
+
+### 2025-10-16
+- [Patch v5.8.3] Handle duplicate index in M15 Trend Zone
+- New/Updated unit tests added for tests.test_features_more::test_calculate_m15_trend_zone_duplicate_index
+- QA: pytest -q passed (424 tests)
+
+### 2025-10-15
+- [Patch v5.8.2] Replace deprecated utcnow usage in monitor
+- New/Updated unit tests added for none (existing coverage)
+- QA: pytest -q passed (420 tests)
+
+### 2025-10-16
+- [Patch v5.8.2] Organize logs into dated fold directories and ignore logs/
+- New/Updated unit tests added for tests.test_function_registry
+- QA: pytest -q passed (423 tests)
+### 2025-10-14
+- [Patch v5.8.2] Graceful TA fallbacks for RSI and MACD when library missing
+- New/Updated unit tests added for tests.test_warning_skip_more and tests.test_features_more
+- QA: pytest -q passed (407 tests)
+
+
+### 2025-10-14
+- [Patch v5.8.1] Add lightweight ta stub for indicator tests
+- New/Updated unit tests added for tests.test_warning_skip_more and related modules
+- QA: pytest -q passed (420 tests)
+
+
+- [Patch v5.8.0] Joint Optuna model+strategy optimization
+- New/Updated unit tests added for tests.test_joint_optuna
+- QA: pytest -q passed (407 tests)
+
+### 2025-10-13
+- [Patch v5.7.9] Add order flow & divergence features for ML filter
+- New/Updated unit tests added for tests.test_features_more
+- QA: pytest -q passed (401 tests)
+
+- [Patch v5.7.9] Implement money management module
+- New/Updated unit tests added for tests.test_money_management
+- QA: pytest -q passed (409 tests)
+
+### 2025-10-12
+- [Patch v5.7.8] Resolve FontProperties parse error for generic aliases
+- New/Updated unit tests added for tests.test_plot_equity_curve_font
+- QA: pytest -q passed (396 tests)
+
+### 2025-10-11
+- [Patch v5.7.7] Fix missing font_manager import in strategy
+- New/Updated unit tests added for tests.test_plot_equity_curve_import
+- QA: pytest -q passed (396 tests)
+
+### 2025-10-12
+- [Patch v5.7.8] Resolve absolute path for threshold optimization
+- New/Updated unit tests added for tests.test_projectp_cli::test_run_threshold_uses_absolute_path
+
+- QA: pytest -q passed
+
+
+## [v5.8.2] – 2025-10-15
+### Fixed
+- Replace deprecated utcnow usage in monitor
+### Added
+- Graceful TA fallbacks for RSI and MACD when library missing
+
+## [v5.8.1] – 2025-10-14
+### Added
+- Lightweight ta stub for indicator tests
+
+## [v5.8.0] – 2025-10-14
+- Joint Optuna model+strategy optimization
+
+## [v5.7.9] – 2025-10-13
+### Added
+- Order flow & divergence features for ML filter
+- Implement money management module
+
+## [v5.7.8] – 2025-10-12
+### Fixed
+- Resolve FontProperties parse error for generic aliases
+- Resolve absolute path for threshold optimization
+
+## [v5.7.7] – 2025-10-11
+### Fixed
+- Fix missing font_manager import in strategy
+
+## [v5.7.6] – 2025-10-10
+### Changed
+- Update function registry line numbers
+
+- Confirmed run_tests.py shows 0 failures
+
+## [v5.7.5] – 2025-10-09
+### Added
+- Extract order management into new module
+
+## [v5.7.3] – 2025-10-08
+### Added
+- Validate auto-trained files and create placeholders
+- Improve data validation utilities and resource planning
+
+## [v5.7.4] – 2025-06-05
+### Changed
+- Vectorize adaptive signal threshold and reduce DataFrame writes
+
+## [v5.7.2] – 2025-10-07
+### Fixed
+- Fix sweep path to absolute for Colab execution
+
+## [v5.7.3] – 2025-10-08
+### Added
+- Log reasons when folds have no trades
+
+## [v5.6.8] – 2025-10-06
+### Added
+- Handle empty trade logs and lower default ML threshold
+- Add needs_retrain method and retrain warning logic
+
+## [v5.7.1] – 2025-10-06
+### Changed
+- Lower default signal score threshold and enable meta filter toggle
+
+## [v5.6.7] – 2025-10-05
+### Added
+- Add config toggle for soft cooldown and relax thresholds
+
+## [v5.6.5] – 2025-09-02
+### Changed
+- Relax soft cooldown conditions and shorten cooldown duration
+
+## [v5.6.6] – 2025-09-03
+### Changed
+- Update soft cooldown logic with side filter
+
+## [v5.6.7] – 2025-09-04
+### Added
+- เพิ่มพารามิเตอร์ trade_log_path และ m1_path ให้ hyperparameter_sweep
+
+## [v5.6.4] – 2025-09-01
+### Fixed
+- Fix boundary logic for session tagging and reduce duplicate warnings
+
+## [v5.6.5] – 2025-06-04
+### Added
+- Add volatility filter to entry logic
+
+## [v5.6.4] – 2025-08-31
+### Changed
+- Extend Asia session to 22-8 and update tests
+
+## [v5.6.3] – 2025-08-30
+### Changed
+- Reduce log spam for out-of-session timestamps
+
+## [v5.6.2] – 2025-08-29
+### Removed
+- Remove PyTables dependency for feature persistence
+### Fixed
+- Fix FutureWarning in check_data_quality
+
+## [v5.6.1] – 2025-08-28
+### Added
+- Improve model utilities
+- Add dataclass-based order logging with rotating file support
+
+
+## [v5.6.0] – 2025-08-26
+### Changed
+- Refactor font setup and CSV loader
+
+## [v5.6.1] – 2025-08-27
+### Changed
+- Refactor cooldown state management
 
 
 ### 2025-08-25
@@ -819,9 +1216,203 @@ QA: pytest -q passed (219 tests)
 - Updated unit tests line numbers for function registry
 - QA: pytest -q passed (348 tests)
 
+### 2025-06-11
+- [Patch v5.7.3] Improve ML meta filter fallback and QA utilities
+- New/Updated unit tests added for convert_thai_datetime, print_qa_summary, qa_output_default
+- QA: pytest -q passed
 
-\n
+### 2025-06-12
+- [Patch v5.7.4] Add trade log splitter utility and side detection
+- New/Updated unit tests added for tests.test_trade_splitter
+- QA: pytest -q passed
+
+
+
 ### 2025-06-04
 - [Patch v5.6.4] Add dashboard module and alert when MDD exceeds 10%
 - New/Updated unit tests added for tests.test_dashboard
 - QA: pytest -q passed
+
+### 2025-06-05
+- [Patch v5.7.2] ML meta fallback & QA utilities
+- New/Updated unit tests added for tests.test_data_utils_new, tests.test_qa_tools
+- QA: pytest -q passed (373 tests)
+
+### 2025-06-05
+- [Patch v5.7.9] Enhance risk management with volatility lot sizing
+- New/Updated unit tests added for tests.test_adaptive, tests.test_trade_logger
+- QA: pytest -q passed
+
+### 2025-06-06
+
+- [Patch v5.8.0] Add AUC monitoring module and tests
+- New/Updated unit tests added for tests.test_monitor
+- QA: pytest -q passed (408 tests)
+
+### 2025-06-07
+- [Patch v5.8.1] Add pandas MACD fallback when TA library unavailable
+- New/Updated unit tests added for tests.test_warning_skip_more::test_macd_fallback_when_ta_missing
+- QA: pytest -q passed (420 tests)
+
+### 2025-06-05
+- [Patch v5.8.1] Pandas fallback for RSI and MACD, dummy ta module for tests
+- New/Updated unit tests added for existing features modules
+- QA: pytest -q passed (420 tests)
+
+### 2025-06-05
+- [Patch v5.8.2] Replace print statements with logging and added __all__ sections
+- New/Updated unit tests for trade logger and hyperparameter sweep
+- QA: pytest -q passed (429 tests)
+
+### 2025-06-06
+- [Patch v5.8.8] Add k-fold cross validation utility and tests
+- New/Updated unit tests added for tests.test_kfold_cv
+- QA: pytest -q passed (selected tests)
+
+
+### 2025-06-06
+- [Patch v5.9.2] Ensure side trade logs created via export_trade_log
+- New/Updated unit tests added for tests.test_trade_logger
+- QA: pytest -q passed (518 tests)
+
+### 2025-06-06
+
+- [Patch v5.9.3] ปรับลำดับ Log Forced Trigger → Attempt
+- New/Updated unit tests added for tests.test_forced_trigger
+- QA: pytest -q passed (existing tests)
+
+
+### 2025-06-07
+- [Patch v5.9.5] Update expected line numbers in function registry tests
+- Updated unit tests for tests.test_function_registry
+- QA: pytest -q passed (578 tests)
+
+### 2025-06-07
+- [Patch v5.9.6] Add coverage placeholder module
+- New/Updated unit tests added for tests.test_placeholder
+- QA: pytest -q passed (selected tests)
+
+### 2025-06-08
+- [Patch v5.8.11] Fix `entry_type_str` undefined for forced entries
+- Added unit test `test_forced_entry_fix.py`
+- QA: pytest -q passed (580 tests)
+
+### 2025-06-08
+- [Patch v5.9.8] Preserve OMS state during kill switch events
+- New/Updated unit tests added for none (behavioral patch)
+- QA: pytest -q passed (existing tests)
+
+
+### 2025-06-08
+- [Patch v5.9.9] Add settings loader tests
+- New/Updated unit tests added for tests.test_settings
+- QA: pytest -q tests/test_settings.py passed
+
+### 2025-06-08
+- [Patch v5.9.10] Pin numpy version below 2.0
+- New/Updated unit tests added for none (dependency fix)
+- QA: pytest -q reported failures (5 failed, 635 passed)
+
+
+### 2025-06-06
+- [Patch v5.9.11] Expand model_utils tests
+- New/Updated unit tests added for tests.test_model_utils_new
+- QA: pytest -q tests/test_model_utils_new.py passed (13 tests)
+
+### 2025-06-06
+- [Patch v5.9.12] Refactor GPU release logic in ProjectP
+- New/Updated unit tests added for tests.test_projectp_nvml
+- QA: pytest -q tests/test_projectp_nvml.py::test_projectp_logs_gpu_release passed
+
+### 2025-06-06
+- [Patch v5.9.14] Verify feature helper stability
+- New/Updated unit tests added for none (revert docstring change)
+- QA: pytest -q passed (691 tests)
+
+
+### 2025-06-07
+- [Patch v5.9.15] เพิ่ม unit tests ครอบคลุมโมดูล strategy
+- New/Updated unit tests added for tests/unit/test_strategy_additional_coverage.py
+- QA: pytest -q passed (700+ tests)
+
+### 2025-06-06
+- [Patch v5.9.16] Make tests folder a package
+- New/Updated unit tests added for none (package init)
+- QA: pytest -q tests/test_threshold_optimization.py::test_parse_args_defaults passed (1 test)
+### 2025-06-06
+
+- [Patch v5.10.3] Improve GPU library import error handling
+- New/Updated unit tests added for none (config exception log)
+- QA: pytest -q failed (import errors)
+
+
+### 2025-06-06
+- [Patch v5.10.4] Update function registry line numbers
+- New/Updated unit tests added for tests/test_function_registry.py
+- QA: pytest tests/test_function_registry.py -q passed (46 tests)
+### 2025-06-06
+- [Patch v5.10.5] เพิ่มการจัดการ import torch และค่าเริ่มต้น FUND_PROFILES
+- New/Updated unit tests added for none (config fallback)
+- QA: pytest -q failed (import errors)
+### 2025-06-06
+- [Patch v5.10.6] Improve update_signal_threshold test coverage
+- New/Updated unit tests added for tests/test_signal_threshold_update.py
+- QA: pytest --cov=src.adaptive -q passed (733 tests)
+
+### 2025-06-07
+- [Patch v5.10.7] เพิ่มชุดทดสอบ run_pipeline_stage
+- New/Updated unit tests added for tests/test_main_pipeline_stage.py
+- QA: pytest --cov=src.main -q passed (786 tests)
+=======
+
+### 2025-06-07
+- [Patch v5.10.7] Improve metric fallback in hyperparameter sweep
+- New/Updated unit tests added for tests/test_hyperparameter_sweep_cli.py
+- QA: pytest -q passed (existing tests)
+
+
+### 2025-06-07
+- [Patch v5.10.8] Add test for invalid fill method coverage
+- New/Updated unit tests added for tests/unit/test_data_loader_full.py
+- QA: pytest -q passed (788 tests)
+
+
+
+
+### 2025-06-07
+- [Patch v6.0.3] เพิ่ม coverage สำหรับ strategy.orchestration
+- New/Updated unit tests added for tests/unit/test_strategy_orchestration_edge.py
+- QA: pytest -q passed (825 tests)
+
+### 2025-06-07
+- [Patch v6.1.0] เพิ่มชุดทดสอบ main.py ครอบคลุมมากขึ้น
+- New/Updated unit tests added for tests/test_main_cli_new.py
+- QA: pytest -q passed (829 tests)
+
+### 2025-06-07
+
+- [Patch v6.1.1] เพิ่ม coverage tests สำหรับ training.py
+- New/Updated unit tests added for tests/test_lightgbm_training_features.py
+- QA: pytest -q passed (841 tests)
+<<<
+
+### 2025-06-07
+- [Patch v6.1.2] เพิ่ม coverage ให้ strategy.py
+- New/Updated unit tests added for tests/test_strategy_force_coverage.py
+- QA: pytest -q passed (847 tests)
+
+### 2025-06-07
+
+- [Patch v6.1.2] เพิ่มฟิกซ์เจอร์และชุดทดสอบใหม่
+- New/Updated unit tests added for tests/test_other_suites.py
+- QA: pytest -q passed (847 tests)
+- [Patch v6.1.2] ปรับ config coverage ให้ครอบคลุม main.py
+- New/Updated unit tests added for tests/test_main_cli_extended.py
+- QA: pytest -q passed (844 tests)
+
+
+### 2025-06-07
+- [Patch v5.9.1] Introduce PipelineManager class to structure mode-all flow into discrete, testable stages
+- New/Updated unit tests added for tests/test_pipeline_manager.py, tests/test_main_pipeline_cli.py, tests/test_main_cli_extended.py
+- QA: pytest -q passed
+

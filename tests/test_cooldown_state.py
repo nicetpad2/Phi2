@@ -3,7 +3,7 @@ import sys
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT_DIR)
-sys.path.insert(0, os.path.join(ROOT_DIR, 'src'))
+sys.path.insert(1, os.path.join(ROOT_DIR, 'src'))
 
 from cooldown_utils import (
     CooldownState,
@@ -14,6 +14,7 @@ from cooldown_utils import (
     enter_cooldown,
 )
 import pytest
+import numpy as np
 
 def test_debounced_warnings():
     state = CooldownState()
@@ -38,3 +39,11 @@ def test_update_losses_invalid():
     state = CooldownState()
     with pytest.raises(TypeError):
         update_losses(state, "-1")
+
+
+def test_update_drawdown_numpy_float():
+    state = CooldownState()
+    value = np.float64(0.25)
+    result = update_drawdown(state, value)
+    assert isinstance(result, float)
+    assert result == 0.25

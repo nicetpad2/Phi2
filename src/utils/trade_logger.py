@@ -57,12 +57,25 @@ def export_trade_log(trades, output_dir, label, fund_name=None):
         with open(os.path.join(qa_dir, f"qa_summary_{label}.log"), "w", encoding="utf-8") as f:
             f.write(f"Trade Log QA: {len(trades)} trades, saved {path}\n")
     else:
-        logger.warning(f"[QA] No trades in {label}. Creating empty trade log.")
+        logger.warning(f"[QA-WARNING] No trades in {label}. Creating empty trade log.")
         pd.DataFrame().to_csv(path, index=False)
         qa_path = os.path.join(qa_dir, f"{label}_trade_qa.log")
         with open(qa_path, "w", encoding="utf-8") as f:
             f.write("[QA] No trade. Output file generated as EMPTY.\n")
         suggest_threshold_relaxation(qa_dir, label)
+
+    # [Patch v5.9.2] Ensure BUY/SELL/NORMAL logs exist for QA
+    try:
+        from src.utils.trade_splitter import split_trade_log, has_buy_sell
+        if trades is not None and not trades.empty and has_buy_sell(trades):
+            split_trade_log(trades, output_dir)
+        else:
+            for fname in ("trade_log_BUY.csv", "trade_log_SELL.csv", "trade_log_NORMAL.csv"):
+                fpath = os.path.join(output_dir, fname)
+                if not os.path.exists(fpath):
+                    pd.DataFrame().to_csv(fpath, index=False)
+    except Exception as e:  # pragma: no cover - best effort QA safeguard
+        logger.warning(f"[QA-WARNING] Failed to prepare side logs: {e}")
 
 
 def suggest_threshold_relaxation(qa_dir: str, label: str) -> None:
@@ -130,3 +143,63 @@ def log_close_order(
         trade_log.warning(msg)
     else:
         trade_log.info(msg)
+
+
+def save_trade_snapshot(data: dict, output_file: str) -> None:
+    """[Patch] Append trade snapshot data to CSV."""
+    if not isinstance(data, dict):
+        raise TypeError("data must be dict")
+    df = pd.DataFrame([data])
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    header = not os.path.exists(output_file)
+    df.to_csv(output_file, mode="a", index=False, header=header)
+
+
+# [Patch v5.7.3] Utility to print QA summary logs
+def print_qa_summary(output_dir: str) -> str:
+    """Print QA summary logs under ``output_dir/qa_logs``.
+
+    Parameters
+    ----------
+    output_dir : str
+        Directory containing ``qa_logs`` folder.
+
+    Returns
+    -------
+    str
+        Concatenated summary text. Empty string if none found.
+    """
+    qa_dir = os.path.join(output_dir, "qa_logs")
+    if not os.path.isdir(qa_dir):
+        msg = f"[QA-WARNING] QA summary directory not found: {qa_dir}"
+        logger.warning(msg)
+        logging.getLogger().warning(msg)
+        return ""
+    summaries = []
+    for fname in os.listdir(qa_dir):
+        if fname.startswith("qa_summary_") and fname.endswith(".log"):
+            path = os.path.join(qa_dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    summaries.append(f.read().strip())
+            except Exception as e:
+                msg = f"[QA-WARNING] Failed reading {path}: {e}"
+                logger.error(msg, exc_info=True)
+                logging.getLogger().error(msg)
+    summary_text = "\n".join(summaries)
+    if summary_text:
+        logger.info(summary_text)
+        logging.getLogger().info(summary_text)
+    return summary_text
+
+
+__all__ = [
+    "Order",
+    "setup_trade_logger",
+    "export_trade_log",
+    "aggregate_trade_logs",
+    "log_open_order",
+    "log_close_order",
+    "print_qa_summary",
+    "save_trade_snapshot",
+]
